@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      深色主题（跟随系统 uiMode）。
+      与 values/themes.xml 的浅色主题同名覆盖，保证冷启动窗口、edge-to-edge 系统栏区域
+      在深色下是深底而不是白底（修复「状态栏白底看不清 / 冷启动闪白」）。
+    -->
+    <style name="Theme.Wb2api" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF121212</item>
+    </style>
+</resources>

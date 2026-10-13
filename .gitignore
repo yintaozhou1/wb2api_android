@@ -1,0 +1,29 @@
+# Gradle / 构建产物
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Kotlin
+.kotlin/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+
+# 本机路径与私密配置（sdk.dir、签名口令）
+local.properties
+
+# 签名密钥（绝不可提交）
+keystore/
+*.jks
+*.keystore
+
+# 打包产物
+*.apk
+*.aab
+*.zip
+
+# 系统
+.DS_Store
+Thumbs.db
