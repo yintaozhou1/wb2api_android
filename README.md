@@ -1,6 +1,6 @@
 # wb2api — Android 原生网关
 
-将 CodeBuddy 账号转换为 **OpenAI 兼容 API** 的 Android 原生实现。应用内直接运行一个
+将 WorkBuddy/CodeBuddy 账号转换为 **OpenAI 兼容 API** 的 Android 原生实现。应用内直接运行一个
 无外部依赖的 HTTP 网关，把账号池、会话粘性、错误处置与定时任务全部收敛到手机本地，
 对外提供 `/v1/chat/completions`、`/v1/responses`、`/v1/models` 等标准端点，
 供 Claude Code、Cherry Studio、OpenWebUI、Cline 等任意 OpenAI 兼容客户端接入。
