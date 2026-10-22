@@ -11,6 +11,8 @@ import com.wb.api.core.LogBus
 import com.wb.api.model.AuthEntry
 import com.wb.api.model.UsageRecord
 import com.wb.api.upstream.Classify
+import com.wb.api.upstream.ConvIds
+import com.wb.api.upstream.Dsml
 import com.wb.api.upstream.ErrKind
 import com.wb.api.upstream.Rewrite
 import com.wb.api.upstream.UpstreamException
@@ -88,9 +90,11 @@ object ChatHandler {
     fun handle(req: Req, res: Res) {
         val bodyObj = parseBody(req, res) ?: return
         val stream = streamFlag(bodyObj)
+        // DSML 还原用的工具名单（请求体里没有 tool 相关键时直接空集，省一次遍历）。
+        val allowedTools = Dsml.allowlistIfPresent(bodyObj, String(req.body))
         runPipeline(req, res, bodyObj, stream) { r, resp, auth, model, realm, rq, reqId, start ->
-            if (stream) forwardStream(r, resp, auth, model, realm, rq, reqId, start)
-            else aggregate(r, resp, auth, model, realm, rq, reqId, start)
+            if (stream) forwardStream(r, resp, auth, model, realm, rq, reqId, start, allowedTools)
+            else aggregate(r, resp, auth, model, realm, rq, reqId, start, allowedTools)
         }
     }
 
@@ -127,9 +131,10 @@ object ChatHandler {
         val echo = if (sanitize) {
             JsonObject(conv.echo.filterKeys { it !in Responses.SANITIZED_ECHO })
         } else conv.echo
+        val allowedTools = Dsml.allowlistIfPresent(raw, String(req.body))
         runPipeline(req, res, conv.chat, stream) { r, resp, auth, model, realm, rq, reqId, start ->
-            if (stream) Responses.forwardStream(r, resp, auth.uid, clientModel, realm, model, reqId, start, conv.effort, echo)
-            else Responses.aggregate(r, resp, auth.uid, clientModel, realm, model, reqId, start, rq, conv.effort, echo)
+            if (stream) Responses.forwardStream(r, resp, auth.uid, clientModel, realm, model, reqId, start, conv.effort, echo, allowedTools)
+            else Responses.aggregate(r, resp, auth.uid, clientModel, realm, model, reqId, start, rq, conv.effort, echo, allowedTools)
         }
     }
 
@@ -166,8 +171,17 @@ object ChatHandler {
             ModelService.maxOutputTokens(realm, model),
         )
 
-        val conversationId = chatBody["conversation_id"]?.primText()
+        val conversationId = chatBody["conversation_id"]?.primText()?.takeIf { it.isNotBlank() }
         val sessionKey = conversationId ?: Rewrite.deriveSessionKey(chatBody)
+        // 会话头族（渠道校验三件套，见 ConvIds 注释）：**轮转循环外生成一次**，
+        // 循环内每次出站复用同一个轮级 ID —— 上游后台按 X-Conversation-Request-ID
+        // 聚合「一次用户发送」，轮内换 ID 会让它在后台碎成多条。
+        val conv = ConvIds(
+            clientConversationId = conversationId.orEmpty(),
+            sessionKey = sessionKey.orEmpty(),
+            turnId = Ids.randomHex(32),
+            traceId = req.header("X-Trace-ID").orEmpty(),
+        )
 
         val reqId = Ids.requestId()
         val start = System.currentTimeMillis()
@@ -184,22 +198,36 @@ object ChatHandler {
         // 选号返回 null 的两种成因要分开报：这里记下「是否因选不到号而终止」，
         // 供 mapError 判定是不是「号都在、只是都对这个模型冷却」（上游 issue #102）。
         var selectionFailed = false
+        // 「模型繁忙」只等一次的额度（上游 issue #46）：不占换号次数、等待期间不占在途名额。
+        var busyWaited = false
 
         try {
             var attempt = 0
             while (attempt < MAX_ROTATE) {
                 val auth = pickAccount(realm, model, sessionKey, tried)
                 if (auth == null) {
+                    // 全池只是被 14003「模型繁忙」的短冷却挡住：先等一次（≤10s）再挑。
+                    // 上游繁忙是间歇的，等几秒大概率就好；直接回 503 会让客户端几秒内
+                    // 连撞几次后熔断，用户体验就是「经常断」（上游 issue #46）。
+                    if (!busyWaited) {
+                        val waitMs = Gateway.pool.modelBusyWaitMs(model, 10_000, realm)
+                        if (waitMs > 0) {
+                            busyWaited = true
+                            LogBus.log("$realm|$model 全池模型繁忙 → 等 ${waitMs}ms 后重试一次")
+                            Thread.sleep(waitMs)
+                            continue
+                        }
+                    }
                     selectionFailed = true
                     break
                 }
                 tried += auth.uid
                 Gateway.pool.acquire(auth.uid)
                 try {
-                    val outbound = Rewrite.finalize(prepared, realm == "global", auth.uid, sessionKey)
+                    val outbound = Rewrite.finalize(prepared, auth.uid, sessionKey, conv.turnId)
                     if (attempt == 0) LogBus.log(outboundSummary(prepared, realm, model, auth.uid, stream))
                     val resp = try {
-                        runBlocking { Gateway.upstream.chat(auth, outbound, req.clientIp) }
+                        runBlocking { Gateway.upstream.chat(auth, outbound, req.clientIp, conv) }
                     } catch (e: Throwable) {
                         val why = e.message ?: e.javaClass.simpleName
                         lastKind = ErrKind.SERVER; lastStatus = 502
@@ -239,7 +267,7 @@ object ChatHandler {
                         Gateway.pool.onError(auth.uid, kind, resp.code, model, text, retryAfter)
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                         LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
-                        if (kind in failFastKinds) { mapError(res, kind, lastStatus, lastBody, model, false); return }
+                        if (kind in failFastKinds) { mapError(res, kind, lastStatus, lastBody, model, false, realm); return }
                     }
                 } finally {
                     Gateway.pool.release(auth.uid)
@@ -247,7 +275,7 @@ object ChatHandler {
                 attempt++
                 if (attempt < MAX_ROTATE) Thread.sleep(backoff(attempt))
             }
-            mapError(res, lastKind, lastStatus, lastBody, model, selectionFailed)
+            mapError(res, lastKind, lastStatus, lastBody, model, selectionFailed, realm)
         } finally {
             val dur = System.currentTimeMillis() - start
             // 第二参 httpOk：HTTP 层面是否把一次成功响应交给了客户端 —— 正常完成（hop.ok）
@@ -392,7 +420,7 @@ object ChatHandler {
      * （对齐 OpenAI 官方流与 Go `upstream/sse.go:stripToolCallNames`）。
      * 部分客户端对重复出现的 name 会误判为「新开了一个工具调用」，进而中断续传。
      */
-    private fun stripToolCallNames(choices: JsonElement, seen: MutableSet<Int>): JsonElement {
+    private fun stripToolCallNames(choices: JsonElement, seen: MutableSet<String>): JsonElement {
         val arr = choices as? JsonArray ?: return choices
         return JsonArray(arr.map { cEl ->
             val c = cEl as? JsonObject ?: return@map cEl
@@ -400,8 +428,13 @@ object ChatHandler {
             val tcs = delta["tool_calls"] as? JsonArray ?: return@map cEl
             val newTcs = JsonArray(tcs.map { tcEl ->
                 val tc = tcEl as? JsonObject ?: return@map tcEl
-                val idx = tc["index"]?.primText()?.toIntOrNull() ?: 0
-                if (seen.add(idx)) return@map tcEl
+                // 键：上游给了 index 就用它；没给 index 的中转改用调用 id —— 否则同帧里
+                // 多个无 index 的调用会全挤进同一个键，第二个的 name 被当「重复分片」删掉，
+                // 客户端拿到没名字的调用、派发不了（新上游 sse.go:stripToolCallNames 同口径）。
+                val key = tc["index"]?.primText()?.toIntOrNull()?.let { "i:$it" }
+                    ?: tc["id"]?.primText()?.takeIf { it.isNotBlank() }?.let { "id:$it" }
+                    ?: "i:0"
+                if (seen.add(key)) return@map tcEl
                 val fn = tc["function"] as? JsonObject ?: return@map tcEl
                 JsonObject(
                     tc.filterKeys { it != "function" } +
@@ -426,9 +459,75 @@ object ChatHandler {
         }
     }
 
+    /**
+     * 识别「HTTP 200 流里内嵌的失败帧」，返回归一后的标准 error 帧文本（不是失败帧则 null）。
+     *
+     * 上游把安全策略拦截（11140 request illegal）、模型级限流（6004）等失败塞在 SSE 里，
+     * 报文是**顶层** `{code,msg,displayMsg}` —— 既没有 choices 也没有 error。帧白名单会把
+     * code/msg 一并剥掉，客户端于是只看到「干净地停止、无任何失败」，网关日志也只剩
+     * 「段无 finish 结束」，把策略拦截误记成上游断流（这正是「静默失败」的成因）。
+     *
+     * 判据必须**窄**：只认「没有 choices 的帧」—— 正文里出现「安全审核」「request illegal」
+     * 甚至字面 11140 都是常态（模型讨论这类话题时就会说这几个词），按文本判必误伤。
+     */
+    private fun embeddedErrorPayload(el: JsonObject): String? {
+        if (el.containsKey("choices") || el.containsKey("error")) return null
+        val code = el["code"]?.primText()?.toDoubleOrNull() ?: return null
+        if (code <= 0) return null
+        val msg = el["msg"]?.primText()?.takeIf { it.isNotBlank() }
+            ?: el["displayMsg"]?.primText().orEmpty()
+        return AppJson.encodeToString(JsonObject.serializer(), buildJsonObject {
+            put("error", buildJsonObject {
+                put("message", JsonPrimitive(msg))
+                put("code", JsonPrimitive(code.toInt()))
+                el["requestId"]?.primText()?.takeIf { it.isNotBlank() }?.let { put("requestId", JsonPrimitive(it)) }
+            })
+        })
+    }
+
+    /** 把某个 delta 帧的 `content` 替换成修复后的文本（无 content 键则原样返回）。 */
+    private fun rewriteContent(el: JsonObject, text: String): JsonObject {
+        val choices = el["choices"] as? JsonArray ?: return el
+        return JsonObject(el.toMutableMap().apply {
+            put("choices", JsonArray(choices.map { c ->
+                val o = c as? JsonObject ?: return@map c
+                val d = o["delta"] as? JsonObject ?: return@map o
+                if (!d.containsKey("content")) return@map o
+                JsonObject(o.toMutableMap().apply {
+                    put("delta", JsonObject(d.toMutableMap().apply { put("content", JsonPrimitive(text)) }))
+                })
+            }))
+        })
+    }
+
+    /** 把 finish_reason 抹成 null（先扣住，等收尾时再按最终结果下发）。 */
+    private fun stripFinishReason(el: JsonObject): JsonObject {
+        val choices = el["choices"] as? JsonArray ?: return el
+        return JsonObject(el.toMutableMap().apply {
+            put("choices", JsonArray(choices.map { c ->
+                val o = c as? JsonObject ?: return@map c
+                JsonObject(o.toMutableMap().apply { put("finish_reason", JsonNull) })
+            }))
+        })
+    }
+
+    /** 只带正文的一帧（DSML 修复器 flush 出来的尾部文本用）。 */
+    private fun contentFrame(text: String): JsonObject = buildJsonObject {
+        put("choices", buildJsonArray {
+            add(buildJsonObject {
+                put("index", JsonPrimitive(0))
+                put("delta", buildJsonObject { put("content", JsonPrimitive(text)) })
+                put("finish_reason", JsonNull)
+            })
+        })
+    }
+
     // ---------- /v1/chat/completions 流式转发 ----------
 
-    private fun forwardStream(res: Res, resp: okhttp3.Response, auth: AuthEntry, model: String, realm: String, req: Req, reqId: String, start: Long): Hop {
+    private fun forwardStream(
+        res: Res, resp: okhttp3.Response, auth: AuthEntry, model: String, realm: String,
+        req: Req, reqId: String, start: Long, allowedTools: Set<String> = emptySet(),
+    ): Hop {
         val reader = BufferedReader(InputStreamReader(bodyStreamOf(resp)))
         var started = false          // 是否已向客户端发送响应头（此后失败无法回退）
         // 首 token 等待（ms）：第一个 data 帧到达时记一次。用于吐字速率的分母
@@ -441,7 +540,7 @@ object ChatHandler {
         var sawDone = false
         // tool_call 的 name 收敛（与官方 OpenAI 流、Go stripToolCallNames 一致）：
         // 同一 index 只有首片保留 function.name，后续分片删除该键。
-        val seenToolNames = HashSet<Int>()
+        val seenToolNames = HashSet<String>()
 
         fun beginOnce() {
             if (!started) {
@@ -451,6 +550,46 @@ object ChatHandler {
                 ))
                 started = true
             }
+        }
+
+        // ── DSML 修复器 + 收尾状态（新上游 sse.go / dsml.go 口径）──
+        // 生产路径恒开启 allowUnknown=true：tools 声明在中转环节丢失是常态，此时只能靠
+        // 「块结构完美 + 工具名形如标识符」弱判定兜底。
+        val repair = Dsml.Repair(allowedTools, allowUnknown = true)
+        var pendingFinish: String? = null
+        var sawFinish = false
+        var markupCalls = 0
+        // 是否真的转发过 tool_calls（静默回合观测用，见收尾处的 WARN）。
+        var sawToolCall = false
+        // 上游已用过的最大 tool_call index。合成 index 必须接在它之后（新上游
+        // sse.go：`idx := maxToolIdx + 1 + synthIdx`）——按「已合成个数」编号会与真实
+        // 调用撞号，客户端按 index 归并时会把两个不同调用合并成一个。
+        var maxToolIdx = -1
+
+        fun streamChunk(delta: JsonObject?, finishReason: String?): JsonObject = buildJsonObject {
+            put("id", JsonPrimitive(firstId ?: "chatcmpl-wb2api"))
+            put("object", JsonPrimitive("chat.completion.chunk"))
+            put("created", JsonPrimitive(System.currentTimeMillis() / 1000))
+            put("model", JsonPrimitive(model))
+            put("choices", buildJsonArray {
+                add(buildJsonObject {
+                    put("index", JsonPrimitive(0))
+                    put("delta", delta ?: buildJsonObject { })
+                    put("finish_reason", if (finishReason == null) JsonNull else JsonPrimitive(finishReason))
+                })
+            })
+            put("usage", JsonNull)
+        }
+
+        fun emitCalls(calls: List<Dsml.Call>) {
+            if (calls.isEmpty()) return
+            beginOnce()
+            val base = maxToolIdx + 1 + markupCalls
+            markupCalls += calls.size
+            val delta = buildJsonObject { put("tool_calls", Dsml.streamToolCalls(calls, base)) }
+            res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), streamChunk(delta, null))}\n\n")
+            frames++
+            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} DSML 还原 ${calls.size} 个调用：${calls.joinToString { it.name }}")
         }
 
         // 关键：**首个 data 帧到达前不发送响应头**。这样「首帧前上游断流 / 首帧即 error 帧」
@@ -471,29 +610,59 @@ object ChatHandler {
                     continue
                 }
                 val payload = line.substring(5).trim()
+                if (payload == "[DONE]") {
+                    if (!started) beginOnce()
+                    sawDone = true
+                    break
+                }
+                val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
+                // 内嵌失败帧：上游把 11140 / 6004 这类失败塞在 SSE **顶层** {code,msg}，
+                // 必须先归一成标准 error 帧，否则白名单会剥掉 code/msg、客户端只看到
+                // 「干净地停下、无任何失败」。
+                val embedded = embeddedErrorPayload(el)
+                val effectivePayload = embedded ?: payload
+                val isErr = embedded != null || el.containsKey("error")
                 if (!started) {
-                    // 首帧：先判 error 帧（如 6004 限流）——未发送则直接换号重试
-                    if (payload != "[DONE]") {
-                        val el0 = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull()
-                        if (el0 != null && el0.containsKey("error")) {
-                            val kind = Classify.frame(payload)
-                            Gateway.pool.onError(auth.uid, kind, 200, model, payload)
-                            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 首帧 error kind=$kind -> 换号重试")
-                            return Hop(ok = false, sent = false)
-                        }
+                    // 首帧即失败：还没向客户端写任何字节 → 无痕换号重试（head veto）。
+                    if (isErr) {
+                        val kind = Classify.frame(effectivePayload)
+                        Gateway.pool.onError(auth.uid, kind, 200, model, effectivePayload)
+                        LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 首帧 error/内嵌失败 kind=$kind -> 换号重试")
+                        return Hop(ok = false, sent = false)
                     }
                     beginOnce()
                 }
-                if (payload == "[DONE]") { sawDone = true; break }
-                val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
-                if (el.containsKey("error")) {
-                    errFrame = payload
-                    res.chunk("data: $payload\n\n"); frames++; continue
+                if (isErr) {
+                    errFrame = effectivePayload
+                    res.chunk("data: $effectivePayload\n\n"); frames++
+                    continue
                 }
                 usage = usage.merge(el)
-                val norm = normalizeFrame(el, firstId, seenToolNames)
+                val ch = (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()
+                ch?.get("finish_reason")?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
+                    sawFinish = true
+                    pendingFinish = it
+                }
+                // 正文过 DSML 修复器：命中标记时暂扣正文、还原成 tool_calls 帧。
+                val piece = (ch?.get("delta") as? JsonObject)?.get("content")?.primText()
+                var frameEl = el
+                if (piece != null) {
+                    val fed = repair.feed(piece)
+                    emitCalls(fed.second)
+                    frameEl = rewriteContent(el, fed.first)
+                }
+                // 记录本帧真实调用的 index（在 emitCalls 之后更新，与上游 writeChunk 的时序一致）
+                ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.let { arr ->
+                    if (arr.isNotEmpty()) sawToolCall = true
+                }
+                ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.forEach { t ->
+                    t.objOrNull()?.get("index")?.primText()?.toIntOrNull()?.let { if (it > maxToolIdx) maxToolIdx = it }
+                }
+                val norm = normalizeFrame(frameEl, firstId, seenToolNames)
                 firstId = norm.first
-                res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), norm.second)}\n\n")
+                // finish_reason 先扣住：若后面还还原出调用，要改写成 tool_calls 再下发。
+                val forwarded = if (ch?.get("finish_reason") != null) stripFinishReason(norm.second) else norm.second
+                res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), forwarded)}\n\n")
                 frames++
             }
             if (!started) {
@@ -501,8 +670,30 @@ object ChatHandler {
                 LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游空流/首帧前断开 -> 换号重试")
                 return Hop(ok = false, sent = false)
             }
-            if (frames == 0) {
-                res.chunk("""data: {"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}""" + "\n\n")
+            if (errFrame == null) {
+                // 收尾：吐出修复器里暂扣的尾部正文（未命中标记时就是原样）。
+                val tail = repair.flush()
+                if (tail.isNotEmpty()) {
+                    val norm = normalizeFrame(contentFrame(tail), firstId, seenToolNames)
+                    firstId = norm.first
+                    res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), norm.second)}\n\n")
+                    frames++
+                }
+                // 终态 finish_reason：还原出调用 → tool_calls；否则沿用上游给的；
+                // 两者都没有（既无 finish_reason 也无 [DONE]）= 断流 → length，
+                // 如实告诉客户端「输出残缺」（新上游 TruncationFinishReason 同口径）。
+                val finalFinish = when {
+                    markupCalls > 0 -> "tool_calls"
+                    pendingFinish != null -> pendingFinish!!
+                    !sawDone && !sawFinish -> "length"
+                    else -> "stop"
+                }
+                // 静默回合观测（上游 issue #44）：与非流式同口径，只记 WARN 不改流。
+                if (allowedTools.isNotEmpty() && !sawToolCall && markupCalls == 0 && finalFinish == "stop") {
+                    LogBus.log("WARN| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop")
+                }
+                res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), streamChunk(null, finalFinish))}\n\n")
+                frames++
             }
             if (!sawDone) {
                 LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游未发 [DONE]（EOF 收尾）→ 网关兜底补发")
@@ -534,7 +725,7 @@ object ChatHandler {
     private fun normalizeFrame(
         el: JsonObject,
         cachedId: String?,
-        seenToolNames: MutableSet<Int>,
+        seenToolNames: MutableSet<String>,
     ): Pair<String?, JsonObject> {
         val out = LinkedHashMap<String, JsonElement>()
         for ((k, v) in el) if (k in frameWhitelist) out[k] = v
@@ -557,7 +748,10 @@ object ChatHandler {
      * **`delta.tool_calls` 被直接丢掉**——于是非流式的工具调用永远返回空回复
      * （客户端以为模型没要调工具）。现在按 index 聚合 arguments 分片并回填 `message.tool_calls`。
      */
-    private fun aggregate(res: Res, resp: okhttp3.Response, auth: AuthEntry, model: String, realm: String, req: Req, reqId: String, start: Long): Hop {
+    private fun aggregate(
+        res: Res, resp: okhttp3.Response, auth: AuthEntry, model: String, realm: String,
+        req: Req, reqId: String, start: Long, allowedTools: Set<String> = emptySet(),
+    ): Hop {
         val content = StringBuilder()
         val reasoning = StringBuilder()
         val toolCalls = LinkedHashMap<Int, ToolAcc>()
@@ -565,6 +759,7 @@ object ChatHandler {
         val created = System.currentTimeMillis() / 1000
         var finish = "stop"
         var sawDone = false
+        var sawFinish = false
         var errFrame: String? = null
         var usage = Tokens()
         val reader = BufferedReader(InputStreamReader(bodyStreamOf(resp)))
@@ -575,6 +770,11 @@ object ChatHandler {
                 val payload = line.substring(5).trim()
                 if (payload == "[DONE]") { sawDone = true; break }
                 val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
+                // 内嵌失败帧（顶层 code/msg、无 choices、无 error）：上游把 11140 / 6004 /
+                // 11-128 这类失败塞在 HTTP 200 的流里。不识别它的后果是**静默成功**——本循环
+                // 跳过无 choices 的帧，最后 content 为空、finish 保持 "stop"，客户端拿到一个
+                // 「成功但什么都没有」的响应，账号也不被处置。必须先归一成标准 error 帧。
+                embeddedErrorPayload(el)?.let { errFrame = it; break }
                 if (el.containsKey("error")) { errFrame = payload; break }
                 el["id"]?.primText()?.let { if (it.isNotBlank()) id = it }
                 usage = usage.merge(el)
@@ -583,7 +783,10 @@ object ChatHandler {
                     delta?.get("content")?.primText()?.let { content.append(it) }
                     delta?.get("reasoning_content")?.primText()?.let { reasoning.append(it) }
                     collectToolCalls(delta, toolCalls)
-                    ch["finish_reason"]?.primText()?.let { if (it != "null") finish = it }
+                    ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
+                        finish = it
+                        sawFinish = true
+                    }
                 }
             }
         } finally { runCatching { reader.close() } }
@@ -598,10 +801,43 @@ object ChatHandler {
             // 错误体**已经写回客户端** → 这里必须标记 sent=true：否则 runPipeline 会把它
             // 当成「首帧前失败」而换号重发，但 Res 已发出字节（sendBytes 里 `if (sent) return`），
             // 后续写入成为 no-op —— 最终「客户端拿到错误、网关却记为成功」并白白多打一次上游。
-            mapError(res, kind, 0, ef, model, false)
+            mapError(res, kind, 0, ef, model, false, realm)
             return Hop(ok = false, sent = true)
         }
 
+        // 断流如实上报：既无 finish_reason 也无 [DONE] 就 EOF → 标 length（新上游同口径）。
+        if (!sawDone && !sawFinish) finish = "length"
+        // DSML 还原（非流式）：本回合没有结构化 tool_calls、正常 stop、正文含标记时，把标记
+        // 还原成 tool_calls —— 否则客户端把标记当正文写进历史、回合结束、工具一次都没跑。
+        if (toolCalls.isEmpty() && finish == "stop" && content.contains(Dsml.PIPE)) {
+            val r = Dsml.Repair(allowedTools)
+            val fed = r.feed(content.toString())
+            val tail = r.flush()
+            if (fed.second.isNotEmpty()) {
+                content.setLength(0)
+                content.append(fed.first).append(tail)
+                fed.second.forEachIndexed { i, c ->
+                    // 显式赋值：本作用域存在同名局部变量（id），`apply { id = … }` 里的裸
+                    // 标识符会被局部变量遮蔽 —— 实测会改写 chat completion 的 id 而不是
+                    // ToolAcc.id（静默错误）。
+                    val acc = ToolAcc()
+                    acc.id = "call_" + System.nanoTime() + "_" + i
+                    acc.name = c.name
+                    acc.args.append(c.arguments)
+                    toolCalls[i] = acc
+                }
+                finish = "tool_calls"
+                LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} DSML 还原 ${fed.second.size} 个调用（非流式）：${fed.second.joinToString { it.name }}")
+            }
+        }
+        // 静默回合观测（上游 issue #44）：声明了 tools、全流零 tool_calls、finish=stop ——
+        // 上游进了工具分支却没产出条目，客户端据此认为回合正常完成、工具一次没跑。
+        // 不改流、不改状态码、不改 usage（模型「判断不需要工具」是合法行为，改写成
+        // 可重试错误会让这类正常回合反复重试、每次都真实计费），只留一条可检索的 WARN。
+        // 零调用按**集合大小**判（上游每帧都带 "tool_calls":[]，按字段存在判会误判）。
+        if (allowedTools.isNotEmpty() && toolCalls.isEmpty() && finish == "stop") {
+            LogBus.log("WARN| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop")
+        }
         val message = buildJsonObject {
             put("role", JsonPrimitive("assistant"))
             if (toolCalls.isEmpty()) {
@@ -710,13 +946,23 @@ object ChatHandler {
         return sb.toString()
     }
 
-    private fun mapError(res: Res, kind: ErrKind, status: Int, body: String, model: String, selectionFailed: Boolean) {
+    private fun mapError(
+        res: Res,
+        kind: ErrKind,
+        status: Int,
+        body: String,
+        model: String,
+        selectionFailed: Boolean,
+        realm: String = "",
+    ) {
         val msg = body.ifBlank {
             when (kind) {
                 ErrKind.SOFT_RATE -> "rate limited: all accounts are cooling down, please wait a moment and try again"
                 ErrKind.WAF_BLOCK -> "upstream WAF blocked"
                 ErrKind.HARD_CREDIT -> "account credit exhausted"
                 ErrKind.SESSION_DEAD -> "all accounts session dead, re-login required"
+                ErrKind.CHANNEL_BLOCK -> "channel verification failed: upstream rejected the " +
+                    "request as non-official-client traffic (HTTP 400 code=11-128/11128 request illegal)"
                 else -> "all accounts are temporarily unavailable, please retry later"
             }
         }
@@ -729,15 +975,31 @@ object ChatHandler {
             ErrKind.BAD_PARAMS, ErrKind.CLIENT -> 400 to "invalid_request_error"
             ErrKind.HARD_CREDIT -> 402 to "insufficient_credit"
             ErrKind.SESSION_DEAD -> 503 to "session_dead"
+            // 渠道校验：这是**请求指纹**问题（首条 system / 会话头族 / UA），不是账号耗尽。
+            // 停在默认的 503 no_healthy_account 会误导用户去查账号池（实测就发生过）。
+            ErrKind.CHANNEL_BLOCK -> 502 to "channel_verification_failed"
             // 11102「该后端无此模型」：用 400 + 明确 code 讲清「不可重试，换个模型」。
             // 停在默认的 no_healthy_account 是「服务端过载」的语义，客户端会一直重试
             // （对齐上游 handler 的 ErrModelBlocked 分支与 issue #81）。
             ErrKind.MODEL_BLOCKED -> 400 to "model_unavailable"
+            // 14003 模型繁忙：503 + Retry-After（上游客户端契约）。与 11102 的区别是
+            // 「等一会儿再来」而不是「换模型」—— 语义错了客户端会做错决策。
+            ErrKind.MODEL_BUSY -> 503 to "model_busy"
             else -> 503 to "no_healthy_account"
         }
         var finalCode = code
         var finalErrCode = errCode
-        var hint = if (errCode == "no_healthy_account") "no healthy account available in pool; check /status or retry later" else ""
+        var hint = when {
+            errCode == "no_healthy_account" ->
+                "no healthy account available in pool; check /status or retry later"
+            errCode == "channel_verification_failed" ->
+                "upstream channel check rejected this request shape (HTTP 400 code=11-128/11128 " +
+                    "\"request illegal\", displayTips: 这次调用没通过渠道校验). The account was " +
+                    "soft-cooled, not disabled; the same body is retried on other accounts. " +
+                    "Check that messages[0] exists and that the gateway is >= 1.6.5 " +
+                    "(session headers X-Conversation-* are required)"
+            else -> ""
+        }
 
         // ★ 模型级阻塞覆盖上面的通用文案（对齐上游 ModelBlocked 覆盖，优先级最高）。
         //   条件与上游一致：**选号失败**（不是别的错误）且全池都被该模型冷却挡住。
@@ -747,10 +1009,14 @@ object ChatHandler {
         // 只在「非 WAF 型失败」时判定模型级阻塞：WAF 封锁期内 pick 也会返回 null，
         // 那种情况必须保持 waf_ip_blocked 的语义，不能改写成 model_unavailable。
         if (selectionFailed && kind != ErrKind.WAF_BLOCK) {
-            val block = Gateway.pool.modelBlocked(model)
+            val block = Gateway.pool.modelBlocked(model, realm)
             if (block.blocked) {
-                finalCode = 400
-                finalErrCode = "model_unavailable"
+                // 14003「忙」与 11102「不可用」是两种语义：前者等几秒就好，后者换模型才行。
+                // 统一报 400 model_unavailable 会让客户端直接放弃（上游 issue #46 的实测）。
+                val busy = block.reason.contains("14003") || block.reason.contains("model_busy") ||
+                    block.reason.contains("繁忙") || block.reason.lowercase().contains("busy")
+                finalCode = if (busy) 503 else 400
+                finalErrCode = if (busy) "model_busy" else "model_unavailable"
                 val sb = StringBuilder("model_blocked: ${block.count} account(s) cooling down this model")
                 if (block.until > 0) {
                     val iso = java.time.OffsetDateTime.ofInstant(
@@ -762,7 +1028,20 @@ object ChatHandler {
                 hint = sb.toString()
             }
         }
-        res.sendError(finalCode, msg, finalErrCode, hint)
+        // 模型繁忙/限流给 Retry-After：客户端按头退避远好过盲撞（上游契约）。
+        // 只有**真的知道**解封时刻才发 Retry-After：账号级软冷却不写模型台账，
+        // 此时 modelBlocked.until = 0 —— 硬给一个 1 秒反而误导客户端立刻重撞。
+        val retryAfter = if (finalErrCode == "model_busy" || finalErrCode == "rate_limit_exceeded") {
+            val block = Gateway.pool.modelBlocked(model, realm)
+            if (block.until > 0) {
+                (block.until - System.currentTimeMillis() / 1000).coerceIn(1, 60)
+            } else 0L
+        } else 0L
+        if (retryAfter > 0) {
+            res.sendError(finalCode, msg, finalErrCode, hint, mapOf("Retry-After" to retryAfter.toString()))
+        } else {
+            res.sendError(finalCode, msg, finalErrCode, hint)
+        }
     }
 
     // ============================================================
@@ -1229,7 +1508,7 @@ object ChatHandler {
         fun aggregate(
             res: Res, resp: okhttp3.Response, uid: String, clientModel: String, realm: String,
             model: String, reqId: String, start: Long, req: Req, effort: String,
-            echo: JsonObject = JsonObject(emptyMap()),
+            echo: JsonObject = JsonObject(emptyMap()), allowedTools: Set<String> = emptySet(),
         ): Hop {
             val content = StringBuilder()
             val reasoning = StringBuilder()
@@ -1246,6 +1525,8 @@ object ChatHandler {
                     val payload = line.substring(5).trim()
                     if (payload == "[DONE]") { sawDone = true; break }
                     val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
+                    // 内嵌失败帧：与 chat 非流式同一口径（见 [embeddedErrorPayload]）。
+                    embeddedErrorPayload(el)?.let { errFrame = it; break }
                     if (el.containsKey("error")) { errFrame = payload; break }
                     usage = usage.merge(el)
                     (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()?.let { ch ->
@@ -1274,13 +1555,32 @@ object ChatHandler {
             // 与 chat 路径同口径（见 [isTruncatedArgs] / Go upstream/truncation.go）：截断时
             // 丢弃 arguments 残缺的 tool_call（原样下发非法 JSON 会让客户端卡死会话），并把
             // 响应标记为 incomplete，告诉客户端「生成未完成、可继续」。
+            // DSML 还原（非流式）：没有结构化 tool_calls 时把正文里的标记还原成调用。
+            val extraCalls = ArrayList<ToolAcc>()
+            if (toolCalls.isEmpty() && content.contains(Dsml.PIPE)) {
+                val r = Dsml.Repair(allowedTools)
+                val fed = r.feed(content.toString())
+                val tail = r.flush()
+                if (fed.second.isNotEmpty()) {
+                    content.setLength(0)
+                    content.append(fed.first).append(tail)
+                    fed.second.forEachIndexed { i, c ->
+                        val acc = ToolAcc()
+                        acc.id = "call_" + System.nanoTime() + "_" + i
+                        acc.name = c.name
+                        acc.args.append(c.arguments)
+                        extraCalls.add(acc)
+                    }
+                    LogBus.log("| # $realm/$model responses DSML 还原 ${fed.second.size} 个调用（非流式）：${fed.second.joinToString { it.name }}")
+                }
+            }
             val truncated = finish == "length" || (finish == null && !sawDone)
             val calls = toolCalls.toSortedMap().values.toList()
             val kept = if (truncated) calls.filter { !isTruncatedArgs(it.args.toString()) } else calls
             val obj = envelope(
                 newId("resp_"), clientModel, System.currentTimeMillis() / 1000,
                 if (truncated) "incomplete" else "completed",
-                outputItems(content.toString(), reasoning.toString(), kept),
+                outputItems(content.toString(), reasoning.toString(), kept + extraCalls),
                 pt, ct, tt, effort, null, usage.cached, usage.reasoning, echo,
                 incompleteReason = if (truncated) "max_output_tokens" else null,
             )
@@ -1307,7 +1607,7 @@ object ChatHandler {
         fun forwardStream(
             res: Res, resp: okhttp3.Response, uid: String, clientModel: String, realm: String,
             model: String, reqId: String, start: Long, effort: String,
-            echo: JsonObject = JsonObject(emptyMap()),
+            echo: JsonObject = JsonObject(emptyMap()), allowedTools: Set<String> = emptySet(),
         ): Hop {
             res.beginStream(200, "text/event-stream", mapOf(
                 "Cache-Control" to "no-cache", "X-Accel-Buffering" to "no", "X-Request-Id" to reqId,
@@ -1339,6 +1639,46 @@ object ChatHandler {
             var messageItemId = ""
             val toolItemIds = HashMap<Int, String>()
 
+            // DSML 修复器：正文里的原生工具标记还原成 function_call（见 upstream/Dsml.kt）。
+            val repair = Dsml.Repair(allowedTools, allowUnknown = true)
+            val markupCalls = ArrayList<Dsml.Call>()
+            var sawFinish = false
+
+            fun emitText(piece: String) {
+                if (piece.isEmpty()) return
+                if (messageItemId.isEmpty()) {
+                    messageItemId = newId("msg_")
+                    outIndex["message"] = outIndex.size
+                    ev("response.output_item.added", buildJsonObject {
+                        put("type", JsonPrimitive("response.output_item.added"))
+                        put("output_index", JsonPrimitive(outIndex["message"] ?: 0))
+                        put("item", buildJsonObject {
+                            put("id", JsonPrimitive(messageItemId)); put("type", JsonPrimitive("message"))
+                            put("status", JsonPrimitive("in_progress")); put("role", JsonPrimitive("assistant"))
+                            put("content", buildJsonArray { })
+                        })
+                    })
+                    ev("response.content_part.added", buildJsonObject {
+                        put("type", JsonPrimitive("response.content_part.added"))
+                        put("item_id", JsonPrimitive(messageItemId))
+                        put("output_index", JsonPrimitive(outIndex["message"] ?: 0))
+                        put("content_index", JsonPrimitive(0))
+                        put("part", buildJsonObject {
+                            put("type", JsonPrimitive("output_text")); put("text", JsonPrimitive(""))
+                            put("annotations", buildJsonArray { })
+                        })
+                    })
+                }
+                content.append(piece)
+                ev("response.output_text.delta", buildJsonObject {
+                    put("type", JsonPrimitive("response.output_text.delta"))
+                    put("item_id", JsonPrimitive(messageItemId))
+                    put("output_index", JsonPrimitive(outIndex["message"] ?: 0))
+                    put("content_index", JsonPrimitive(0))
+                    put("delta", JsonPrimitive(piece))
+                })
+            }
+
             var errFrame: String? = null
             var usage = Tokens()
             // 收尾信号：`finish_reason`（normal stop / length / tool_calls）与是否收到 [DONE]。
@@ -1353,11 +1693,17 @@ object ChatHandler {
                     val payload = line.substring(5).trim()
                     if (payload == "[DONE]") { sawDone = true; break }
                     val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
+                    // 内嵌失败帧（顶层 code/msg、无 choices）：先归一成标准 error 帧再判。
+                    val embedded = embeddedErrorPayload(el)
+                    if (embedded != null) { errFrame = embedded; break }
                     if (el.containsKey("error")) { errFrame = payload; break }
                     usage = usage.merge(el)
                     val ch = (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull() ?: continue
                     // finish_reason 常出现在「没有 delta 的收尾帧」里，必须在取 delta 之前读。
-                    ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let { finish = it }
+                    ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
+                        finish = it
+                        sawFinish = true
+                    }
                     val d = ch["delta"]?.objOrNull() ?: continue
 
                     // ---- 推理轨迹 ----
@@ -1392,39 +1738,11 @@ object ChatHandler {
                         })
                     }
 
-                    // ---- 正文 ----
+                    // ---- 正文（过 DSML 修复器：命中原生工具标记则还原成 function_call）----
                     d["content"]?.primText()?.takeIf { it.isNotEmpty() }?.let { piece ->
-                        if (messageItemId.isEmpty()) {
-                            messageItemId = newId("msg_")
-                            outIndex["message"] = outIndex.size
-                            ev("response.output_item.added", buildJsonObject {
-                                put("type", JsonPrimitive("response.output_item.added"))
-                                put("output_index", JsonPrimitive(outIndex["message"] ?: 0))
-                                put("item", buildJsonObject {
-                                    put("id", JsonPrimitive(messageItemId)); put("type", JsonPrimitive("message"))
-                                    put("status", JsonPrimitive("in_progress")); put("role", JsonPrimitive("assistant"))
-                                    put("content", buildJsonArray { })
-                                })
-                            })
-                            ev("response.content_part.added", buildJsonObject {
-                                put("type", JsonPrimitive("response.content_part.added"))
-                                put("item_id", JsonPrimitive(messageItemId))
-                                put("output_index", JsonPrimitive(outIndex["message"] ?: 0))
-                                put("content_index", JsonPrimitive(0))
-                                put("part", buildJsonObject {
-                                    put("type", JsonPrimitive("output_text")); put("text", JsonPrimitive(""))
-                                    put("annotations", buildJsonArray { })
-                                })
-                            })
-                        }
-                        content.append(piece)
-                        ev("response.output_text.delta", buildJsonObject {
-                            put("type", JsonPrimitive("response.output_text.delta"))
-                            put("item_id", JsonPrimitive(messageItemId))
-                            put("output_index", JsonPrimitive(outIndex["message"] ?: 0))
-                            put("content_index", JsonPrimitive(0))
-                            put("delta", JsonPrimitive(piece))
-                        })
+                        val fed = repair.feed(piece)
+                        if (fed.second.isNotEmpty()) markupCalls.addAll(fed.second)
+                        emitText(fed.first)
                     }
 
                     // ---- 工具调用（关键：原实现完全没处理 delta.tool_calls）----
@@ -1479,7 +1797,42 @@ object ChatHandler {
                     )
                 })
                 res.endStream()
-                return Hop(ok = false)
+                // 与 chat 流式路径同口径：字节已经写回客户端（上面的 response.failed
+                // 与 endStream），必须标 sent=true。否则 runPipeline 判成「首帧前失败」
+                // 而换号重试 —— 但 Res.sent 已为 true，重试的 chunk 全被丢弃，客户端
+                // 只看到一个 failed，网关却白打 2 次上游（真实计费）并记 3 次错误。
+                return Hop(ok = false, sent = true)
+            }
+
+            // DSML：吐出暂扣的尾部正文，并把还原出的调用并入 toolCalls，让它们与结构化
+            // 调用走完全相同的收尾事件（added → arguments.done → item.done）。
+            emitText(repair.flush())
+            if (markupCalls.isNotEmpty()) {
+                var idx = (toolCalls.keys.maxOrNull() ?: -1) + 1
+                for (c in markupCalls) {
+                    // 同上：本作用域有 `val id`（response id），必须用显式成员赋值。
+                    val acc = ToolAcc()
+                    acc.id = "call_" + System.nanoTime() + "_" + idx
+                    acc.name = c.name
+                    acc.args.append(c.arguments)
+                    toolCalls[idx] = acc
+                    toolItemIds[idx] = newId("fc_")
+                    outIndex["fc:$idx"] = outIndex.size
+                    ev("response.output_item.added", buildJsonObject {
+                        put("type", JsonPrimitive("response.output_item.added"))
+                        put("output_index", JsonPrimitive(outIndex["fc:$idx"] ?: 0))
+                        put("item", buildJsonObject {
+                            put("type", JsonPrimitive("function_call"))
+                            put("id", JsonPrimitive(toolItemIds[idx] ?: ""))
+                            put("call_id", JsonPrimitive(acc.id))
+                            put("name", JsonPrimitive(acc.name))
+                            put("arguments", JsonPrimitive(""))
+                            put("status", JsonPrimitive("in_progress"))
+                        })
+                    })
+                    idx++
+                }
+                LogBus.log("| # $realm/$model responses DSML 还原 ${markupCalls.size} 个调用：${markupCalls.joinToString { it.name }}")
             }
 
             // 收尾事件（顺序与 output 数组一致）

@@ -87,7 +87,13 @@ class Res(private val out: OutputStream) {
     fun sendJson(code: Int, el: JsonElement, extra: Map<String, String> = emptyMap()) =
         sendBytes(code, AppJson.encodeToString(JsonElement.serializer(), el).toByteArray(), "application/json", extra)
 
-    fun sendError(code: Int, message: String, errCode: String = "api_error", hint: String = "") {
+    fun sendError(
+        code: Int,
+        message: String,
+        errCode: String = "api_error",
+        hint: String = "",
+        extra: Map<String, String> = emptyMap(),
+    ) {
         val obj = buildJsonObject {
             put("error", buildJsonObject {
                 put("message", JsonPrimitive(message))
@@ -96,7 +102,7 @@ class Res(private val out: OutputStream) {
                 if (hint.isNotBlank()) put("gateway_hint", JsonPrimitive(hint))
             })
         }
-        sendJson(code, obj)
+        sendJson(code, obj, extra)
     }
 
     fun beginStream(code: Int = 200, ctype: String = "text/event-stream", extra: Map<String, String> = emptyMap()) {
@@ -107,6 +113,8 @@ class Res(private val out: OutputStream) {
 
     fun chunk(s: String) {
         if (!chunked) return
+        // 空串会被编码成 "0\\r\\n\\r\\n" —— 那是 chunked 的**终止符**，会静默关闭流。
+        if (s.isEmpty()) return
         val b = s.toByteArray()
         out.write("${Integer.toHexString(b.size)}\r\n".toByteArray())
         out.write(b); out.write("\r\n".toByteArray()); out.flush()
@@ -129,6 +137,19 @@ class Res(private val out: OutputStream) {
  * 同时把「一个 Content-Length 头就打爆进程堆」这条路封死。
  */
 private const val MAX_BODY_BYTES = 32L * 1024 * 1024
+
+/**
+ * 单行（请求行 / 请求头）的字节上限。
+ *
+ * 监听在 `0.0.0.0`，而 [readLine] 原实现逐字节累积、**没有任何上限**：一条不带换行
+ * 的 10 GB 请求行（或无限条请求头）就能把堆打满、进程被 OOM 杀掉。body 的
+ * [MAX_BODY_BYTES] 只兜住了 body，请求头这一侧同样要有边界。
+ * 8 KB 远大于任何正常请求行/头（URL 与 Cookie 的常见上限也在此量级）。
+ */
+private const val MAX_LINE_BYTES = 8 * 1024
+
+/** 请求头条数上限（同样防「无限头」把内存打满）。 */
+private const val MAX_HEADER_COUNT = 128
 
 /** 请求体超过 [MAX_BODY_BYTES] 时由 [EmbeddedHttpServer.readRequest] 抛出，回 413。 */
 class RequestTooLargeException : java.io.IOException("request body too large")
@@ -317,6 +338,7 @@ class EmbeddedHttpServer(
         while (true) {
             val h = readLine(input) ?: break
             if (h.isEmpty()) break
+            if (headers.size >= MAX_HEADER_COUNT) throw RequestTooLargeException()
             val idx = h.indexOf(':')
             if (idx > 0) headers[h.substring(0, idx).trim().lowercase()] = h.substring(idx + 1).trim()
         }
@@ -339,7 +361,11 @@ class EmbeddedHttpServer(
         var c = input.read()
         if (c == -1) return null
         while (c != -1 && c != '\n'.code) {
-            if (c != '\r'.code) sb.append(c.toChar())
+            if (c != '\r'.code) {
+                // 超长单行 → 413（与 body 超限同一条拒绝路径），而不是无界累积到 OOM。
+                if (sb.length >= MAX_LINE_BYTES) throw RequestTooLargeException()
+                sb.append(c.toChar())
+            }
             c = input.read()
         }
         return sb.toString()
@@ -359,7 +385,9 @@ class EmbeddedHttpServer(
         val out = java.io.ByteArrayOutputStream()
         while (true) {
             val sizeLine = readLine(input) ?: break
-            val size = sizeLine.trim().split(';')[0].toIntOrNull(16) ?: break
+            // 负数分块（"-1\\r\\n"）会让下面的 ByteArray(-1) 抛 NegativeArraySizeException；
+            // 畸形分块按「流结束」处理即可（与 toIntOrNull 失败同一条路径）。
+            val size = sizeLine.trim().split(';')[0].toIntOrNull(16)?.takeIf { it >= 0 } ?: break
             if (size == 0) { readLine(input); break }
             // 分块传输同样要有上限：原实现往 ByteArrayOutputStream 无界累积，等价于一条无上限的写。
             if (out.size().toLong() + size > MAX_BODY_BYTES) throw RequestTooLargeException()

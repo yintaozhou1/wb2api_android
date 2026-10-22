@@ -29,6 +29,16 @@ object Rewrite {
 
     private const val DEFAULT_DEEPSEEK_EFFORT = "high"
 
+    /**
+     * 渠道校验兜底 system 的正文（同新上游 `prompt.Degraded`）。
+     *
+     * 刻意极简中性：只承担「让 messages[0] 是 system」这一个结构职责，不注入任何
+     * 人格 / 工具约定 / 项目规范 —— 那些属于客户端。改写用户语义会改变模型行为，
+     * 而这个兜底的存在理由与内容无关。
+     */
+    private const val DEGRADED_SYSTEM =
+        "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
+
     private val effortRank = mapOf(
         "off" to 0, "minimal" to 1, "low" to 2, "medium" to 3, "high" to 4, "xhigh" to 5, "max" to 6,
     )
@@ -73,6 +83,10 @@ object Rewrite {
         normalizeToolPatterns(obj)
         normalizeRoles(obj)
         normalizeImageURL(obj)
+        // 新上游 payload.go：`stop` 传字符串时上游要求数组形态；content parts 里的
+        // 思考片段（reasoning_text / reasoning）上游不认，留着会 400。
+        normalizeStop(obj)
+        dropReasoningContentParts(obj)
 
         // 5) 工具配对：先重排再清理（不完整配对会让上游对之后每条消息都返 400）。
         @Suppress("UNCHECKED_CAST")
@@ -97,23 +111,52 @@ object Rewrite {
         return obj.toJsonObject()
     }
 
-    /** global realm 兜底 system 注入（首条非 system 时补一条），对齐 Go ensureConsoleSystem。 */
-    fun ensureConsoleSystem(input: JsonObject): JsonObject {
+    /**
+     * 保证 `messages[0]` 是 `role=system` —— 上游**渠道校验的硬要求**。
+     *
+     * 2026-10-20 真机实测（国际版 5.8.4）三条对照：
+     * ```
+     * 首条 user       → 400 11-128 "first message is not system prompt"
+     * 首条 developer  → 400 11-128 "Illegal API invocation from an unapproved channel"
+     * 首条 system     → 200（同一 body 其余部分不变）
+     * ```
+     * 也就是说这不是内容策略、不是账号问题：**首条角色本身就是渠道校验的一部分**。
+     * 大量 SDK / 手搓 curl / 探针都不带 system（本项目的模型自检就是
+     * `messages:[{role:user,content:"hi"}]`），于是每一次请求都必然被拦。
+     *
+     * 语义边界（对齐新上游 `prompt.EnsureSystemFirst`）：
+     *  - 首条已是 system → 零改动；
+     *  - 首条是 developer → **就地改成 system**（内容逐字保留：上游 role 白名单不含
+     *    developer，另插一条 developer 只会多制造一次必然归一）；
+     *  - 其余（首条 user/assistant/tool）→ 最前补一条中性 system，其它消息逐字不动。
+     *
+     * 提示词用中性极简（同新上游 `prompt.Degraded`）：只为了让请求通过渠道校验，
+     * 不改变用户指令的语义，也不替客户端做人格设定。
+     */
+    fun ensureSystemFirst(input: JsonObject): JsonObject {
         val obj = input.toPlainObject()
         @Suppress("UNCHECKED_CAST")
         val msgs = obj["messages"] as? MutableList<Any?> ?: return input
         if (msgs.isEmpty()) return input
-        val first = msgs[0] as? Map<*, *>
-        val role = (first?.get("role") as? String)?.trim()?.lowercase()
+        @Suppress("UNCHECKED_CAST")
+        val first = msgs[0] as? MutableMap<Any?, Any?> ?: return input
+        val role = (first["role"] as? String)?.trim()?.lowercase()
         if (role == "system") return input
-        val injected = mutableListOf<Any?>(mutableMapOf<String, Any?>("role" to "system", "content" to "You are a helpful assistant."))
+        if (role == "developer") {
+            first["role"] = "system"
+            return obj.toJsonObject()
+        }
+        val injected = mutableListOf<Any?>(
+            mutableMapOf<String, Any?>("role" to "system", "content" to DEGRADED_SYSTEM),
+        )
         injected.addAll(msgs)
         obj["messages"] = injected
         return obj.toJsonObject()
     }
 
     /**
-     * 最终序列化：global 注入 system + 确定 `prompt_cache_key`（费用与延迟优化）。
+     * 最终序列化：`messages[0]` 兜底成 system（渠道校验）+ 确定 `prompt_cache_key`
+     * （费用与延迟优化）。
      *
      * 缓存键的两条规则（对齐官方 Prompt Caching 语义）：
      *  1. 客户端**自带** `prompt_cache_key` 时原样沿用——多租户 / 多工作流隔离是客户端的职责，
@@ -122,16 +165,50 @@ object Rewrite {
      *     就是一条全新的路由，前缀缓存永远打不中——原实现把整段 system+user 历史都算进键里，
      *     每轮都变，这正是「缓存不生效」的直接原因（同时它也让会话粘性每轮失效）。
      */
-    fun finalize(prepared: JsonObject, global: Boolean, uid: String, conversationId: String?): String {
-        val obj = (if (global) ensureConsoleSystem(prepared) else prepared).toPlainObject()
+    fun finalize(prepared: JsonObject, uid: String, conversationId: String?, turnId: String = ""): String {
+        val obj = ensureSystemFirst(prepared).toPlainObject()
         val existing = (obj["prompt_cache_key"] as? String)?.trim().orEmpty()
         if (existing.isEmpty() && uid.isNotBlank()) {
-            val key = "wb2a-" + java.security.MessageDigest.getInstance("SHA-256")
-                .digest(("cache:$uid:${conversationId ?: ""}").toByteArray())
-                .take(12).joinToString("") { "%02x".format(it) }
-            obj["prompt_cache_key"] = key
+            // 与 X-Conversation-ID 同源、同形态（UUID v4）：该键是上游**前缀缓存槽**的来源，
+            // 官方两者本来就对应同一个会话。旧实现是 "wb2a-"+12 hex —— 自带项目缩写、
+            // 长度也与官方不同，是可直接判别的指纹（上游 issue #51）。
+            obj["prompt_cache_key"] = Up.uuidFor(uid, conversationId, "")
         }
+        // body 侧会话轮级字段（上游 conv_fields.go / issue #51）：头里写了
+        // X-Conversation-Request-ID，体里一条都没有，本身就是「头体不一致」的形态。
+        if (turnId.isNotBlank()) injectConversationFields(obj, turnId)
         return com.wb.api.core.AppJson.encodeToString(JsonElement.serializer(), obj.toJsonObject())
+    }
+
+    /**
+     * body 侧会话轮级字段（对齐新上游 `conv_fields.go` / issue #51）。
+     *
+     * 官方桌面端把「这一轮属于哪个 request-id」同时写在**头**和**体**里：
+     * ```
+     * messages[i] = { role:"user", content:[...], agent:"cli",
+     *                 conversationRequestId:"<该轮 X-Conversation-Request-ID>",
+     *                 startsNewUserRequest:true }
+     * ```
+     *
+     * 边界（不伪造）：
+     *  - 只给**当前轮**（最后一条 user 消息）写；历史消息的轮级 ID 客户端没给，
+     *    OpenAI 协议里也没有这个字段，网关无从得知 —— 对不上的 ID 比缺失更容易被
+     *    关联分析抓出来，所以不编造；
+     *  - 客户端已自带 `conversationRequestId` → 原值优先，不覆盖。
+     */
+    private fun injectConversationFields(obj: MutableMap<String, Any?>, turnId: String) {
+        @Suppress("UNCHECKED_CAST")
+        val msgs = obj["messages"] as? MutableList<Any?> ?: return
+        for (i in msgs.indices.reversed()) {
+            @Suppress("UNCHECKED_CAST")
+            val m = msgs[i] as? MutableMap<Any?, Any?> ?: continue
+            if (!(m["role"] as? String).equals("user", ignoreCase = true)) continue
+            if ((m["conversationRequestId"] as? String)?.isNotBlank() == true) return
+            m["conversationRequestId"] = turnId
+            m["startsNewUserRequest"] = true
+            if ((m["agent"] as? String).isNullOrBlank()) m["agent"] = "cli"
+            return
+        }
     }
 
     // ======================= 内部实现 =======================
@@ -283,6 +360,43 @@ object Rewrite {
 
     // ---- 工具配对：结果块重排 ----
 
+    /**
+     * `stop` 由字符串归一成数组（同一语义，规避上游只接受数组的校验）。
+     * 对齐新上游 `payload.go:normalizeStop`。
+     */
+    private fun normalizeStop(obj: MutableMap<String, Any?>) {
+        val s = obj["stop"] as? String ?: return
+        obj["stop"] = listOf(s)
+    }
+
+    /**
+     * 删除 content 数组里的思考片段（`reasoning_text` / `reasoning`）。
+     *
+     * 部分客户端把思维链塞进 content parts，上游不认这类 part → 400；整条只剩思考片段、
+     * 又没有 tool_calls 的消息一并删除（否则上游会为空 content 报错）。
+     * 对齐新上游 `payload.go:dropReasoningContentParts`。
+     */
+    private fun dropReasoningContentParts(obj: MutableMap<String, Any?>) {
+        val msgs = obj["messages"] as? MutableList<Any?> ?: return
+        val out = ArrayList<Any?>(msgs.size)
+        for (raw in msgs) {
+            val msg = raw as? MutableMap<String, Any?>
+            val parts = msg?.get("content") as? List<*>
+            if (msg == null || parts == null) {
+                out.add(raw) // 字符串 content（或字段缺失）不受影响
+                continue
+            }
+            val kept = parts.filterNot { p ->
+                val t = ((p as? Map<*, *>)?.get("type") as? String)?.trim()
+                t == "reasoning_text" || t == "reasoning"
+            }
+            if (kept.isEmpty() && !msg.containsKey("tool_calls")) continue
+            msg["content"] = kept
+            out.add(msg)
+        }
+        obj["messages"] = out
+    }
+
     private fun repackToolResultBlocks(messages: MutableList<Any?>): MutableList<Any?> {
         if (messages.size < 3) return messages
         val out = ArrayList<Any?>(messages.size)
@@ -334,6 +448,8 @@ object Rewrite {
         if (messages.isEmpty()) return messages
         val callIDs = HashSet<String>()
         val resultIDs = HashSet<String>()
+        // 缺功能名的调用要**连同结果成对剔除**（见 toolCallNameMissing）。
+        val nameBadIDs = HashSet<String>()
         var hasTraffic = false
         for (m in messages) {
             val msg = m as? Map<*, *> ?: continue
@@ -345,14 +461,18 @@ object Rewrite {
                 "assistant" -> {
                     val tcs = msg["tool_calls"] as? List<*> ?: continue
                     for (tci in tcs) {
-                        val id = (tci as? Map<*, *>)?.get("id") as? String
-                        if (!id.isNullOrEmpty()) { callIDs.add(id); hasTraffic = true }
+                        val tc = tci as? Map<*, *>
+                        val id = tc?.get("id") as? String
+                        if (!id.isNullOrEmpty()) {
+                            if (toolCallNameMissing(tc)) nameBadIDs.add(id)
+                            callIDs.add(id); hasTraffic = true
+                        }
                     }
                 }
             }
         }
         if (!hasTraffic) return messages
-        val keepCalls = callIDs.filter { resultIDs.contains(it) }.toHashSet()
+        val keepCalls = callIDs.filter { resultIDs.contains(it) && !nameBadIDs.contains(it) }.toHashSet()
         var changed = false
         // 1) assistant.tool_calls 按 keepCalls 对称裁剪
         for (m in messages) {
@@ -379,16 +499,67 @@ object Rewrite {
         return if (!changed) messages else keptMsgs
     }
 
+    /**
+     * tool_calls 单项是否缺少可用功能名（function 缺失 / name 缺失 / name 空白）。
+     *
+     * 这类条目上游直接判 **11133**（`tool_calls[i].function.name must be a non-empty string`），
+     * **带不带配对结果都拒** —— 是线上「整条会话每轮 400、只能手动清空历史」的成因。
+     * 对齐新上游 `tool_pairing.go:toolCallNameMissing`。
+     */
+    private fun toolCallNameMissing(tc: Map<*, *>?): Boolean {
+        val fn = tc?.get("function") as? Map<*, *> ?: return true
+        val name = fn["name"] as? String ?: return true
+        return name.isBlank()
+    }
+
     // ---- DeepSeek thinking ----
 
     private fun isDeepSeekModel(model: String): Boolean =
         model.trim().lowercase().startsWith("deepseek")
+
+    /**
+     * 「预算被思考吃光」的预防阈值（对齐新上游 `starved.go` 的实测数据）。
+     *
+     * 上游把 reasoning 与正文字节算在**同一份** max_tokens 里，思考没有独立上限：
+     * ```
+     * max_tokens=60/100/150/200/300 → thinking 恰等于预算，正文 0 字节
+     * max_tokens=400                → 思考 166~272，正文开始出现（时好时坏）
+     * thinking:{type:disabled} 同预算 → 正文正常、finish=stop
+     * ```
+     * 客户端给这种额度时，思考会独吞整份预算 → 空回复（finish_reason=length）。
+     * Agent 循环尤其致命：客户端认为回合正常结束，任务静默停住。
+     *
+     * 上游的做法是「事后同额度关思考重发一次」；本端改为**事前不注入思考** ——
+     * 结果等价（思考本来也拿不到），但覆盖流式与非流式、且不额外消耗一次上游请求。
+     * 客户端**显式**声明 thinking / reasoning_effort 时不干预（尊重其语义）。
+     */
+    private const val STARVED_BUDGET_LOW = 16L
+    private const val STARVED_BUDGET_HIGH = 400L
+
+    /** 读输出限额的三个别名（max_completion_tokens 已在前面翻译成 max_tokens）。未携带 → 0。 */
+    private fun outputBudget(obj: MutableMap<String, Any?>): Long {
+        for (k in listOf("max_tokens", "max_completion_tokens", "max_output_tokens")) {
+            val v = when (val raw = obj[k]) {
+                is Number -> raw.toLong()
+                is String -> raw.trim().toLongOrNull()
+                else -> null
+            } ?: continue
+            if (v > 0) return v
+        }
+        return 0L
+    }
 
     private fun injectThinking(obj: MutableMap<String, Any?>, defaultEffort: String) {
         val model = obj["model"] as? String ?: return
         if (!isDeepSeekModel(model)) return
         val th = asStringMap(obj["thinking"])
         val typ = (th?.get("type") as? String)?.trim() ?: ""
+        if (typ.isEmpty()) {
+            // 客户端没声明思考：小额预算下思考必然吃光正文 → 不注入（见上面的实测表）。
+            // 16 以下不拦：官方客户端用 max_tokens=1 做 key 探活，那种请求按原样即可。
+            val budget = outputBudget(obj)
+            if (budget in STARVED_BUDGET_LOW until STARVED_BUDGET_HIGH) return
+        }
         if (typ.isNotEmpty()) {
             if (typ.equals("disabled", ignoreCase = true)) {
                 obj.remove("reasoning_effort"); obj.remove("reasoningEffort"); return

@@ -36,10 +36,24 @@ object Up {
     const val ORIGIN_CN = "https://www.codebuddy.cn"
     const val ORIGIN_GLOBAL = "https://www.workbuddy.ai"
 
+    /** 设备授权 / 插件域仍用插件 CLI 形态（该端点按插件口径签发）。 */
     const val UA_CLI = "CLI/2.63.2 CodeBuddy/2.63.2"
     const val UA_IDE = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
-    const val DEFAULT_CLIENT_VERSION = "5.5.4"
-    const val DEFAULT_CLI_VERSION = "2.137.1"
+
+    /**
+     * 出站 WorkBuddy 客户端版本 —— 对齐新上游 `headers.go`（2026-10-20/21 双版本真机抓包）：
+     * 国内版 **5.8.3**（endpoint www.workbuddy.cn）、国际版 **5.8.4**（www.workbuddy.ai）。
+     * 两版发版节奏不同，**必须按 realm 分开**：国际版用 CN 的版本号会与上游实际分发包对不上
+     * （旧实现共用 5.5.4，是「UA 指纹过期」的一部分）。
+     */
+    const val DEFAULT_CLIENT_VERSION_CN = "5.8.3"
+    const val DEFAULT_CLIENT_VERSION_GLOBAL = "5.8.4"
+    /** 官方内置 CLI 版本（两版分发包同一值）。 */
+    const val DEFAULT_CLI_VERSION = "2.161.0"
+
+    /** 按 realm 取生效的客户端版本。 */
+    fun clientVersion(realm: String): String =
+        if (realm == "global") DEFAULT_CLIENT_VERSION_GLOBAL else DEFAULT_CLIENT_VERSION_CN
 
     // paths
     const val P_CHAT = "/v2/chat/completions"
@@ -109,8 +123,8 @@ object Up {
     /** 活动补偿（blackcat.go:86）。 */
     const val P_CLAIM_COMPENSATION = "/billing/meter/claim-compensation"
 
-    /** 桌面客户端 UA：WorkBuddy 5.5.6 内嵌 CLI 2.137.1（desktop.go:43 desktopUA）。 */
-    const val UA_DESKTOP = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+    /** 桌面客户端 UA：WorkBuddy 5.8.3 内嵌 CLI 2.161.0。 */
+    const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
     /** Web 端浏览器 UA（desktop.go:267）。 */
     const val UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
     /** 小程序口径头值（tasks.go:35）。 */
@@ -148,27 +162,165 @@ object Up {
     fun meterPaths(realm: String, v2: String, alt: String): List<String> =
         if (realm == "global") listOf(alt, v2) else listOf(v2, alt)
 
-    fun workBuddyUA(realm: String, clientVersion: String = DEFAULT_CLIENT_VERSION, cliVersion: String = DEFAULT_CLI_VERSION): String {
-        val platform = if (realm == "global") "WorkBuddy AI" else "WorkBuddy"
-        return "WorkBuddy/$clientVersion $platform/$clientVersion CLI/$cliVersion"
+    /**
+     * 三段式 WorkBuddy UA（官方 `buildUserAgent` 形态）：`WorkBuddy/<v> <brand>/<v> CLI/<cli>`。
+     *
+     * 首段**恒为驼峰 WorkBuddy**，只有第二段随 realm 换品牌：CN `WorkBuddy`、
+     * global `workbuddy-ai`（国际版 productName，小写连字符）。旧实现给 global 用
+     * `WorkBuddy AI`（带空格大写）与真机抓包不符。
+     */
+    fun workBuddyUA(
+        realm: String,
+        clientVersion: String = clientVersion(realm),
+        cliVersion: String = DEFAULT_CLI_VERSION,
+    ): String {
+        val brand = if (realm == "global") "workbuddy-ai" else "WorkBuddy"
+        return "WorkBuddy/$clientVersion $brand/$clientVersion CLI/$cliVersion"
     }
 
-    /** billing 域单段 UA（官方 banner 覆写形态）。 */
-    fun billingUA(clientVersion: String = DEFAULT_CLIENT_VERSION): String = "WorkBuddy/$clientVersion"
+    /** billing 域单段 UA（官方 banner 覆写形态，按 realm 取版本）。 */
+    fun billingUA(realm: String = "cn", clientVersion: String = clientVersion(realm)): String =
+        "WorkBuddy/$clientVersion"
+
+    /**
+     * `/v3/config` 的第二路探测 UA：单品牌两段式（`WorkBuddy/<v> CLI/<cli>`）。
+     * 该端点按 UA 家族下发不同模型集合，官方真机同时出现两种形态，故两路都要探。
+     */
+    fun workBuddyUaLite(realm: String): String =
+        "WorkBuddy/${clientVersion(realm)} CLI/$DEFAULT_CLI_VERSION"
 
     /** 按 uid + 用途稳定派生 36 hex 标识（跨重启恒定，账号间互异）。 */
     fun stableId(uid: String, purpose: String): String {
         val d = MessageDigest.getInstance("SHA-256").digest("wb2a:$purpose:$uid".toByteArray())
         return d.take(18).joinToString("") { "%02x".format(it) }
     }
+
+    /**
+     * `X-Conversation-ID`（客户端没声明会话时使用）—— **渠道校验三件套**之一。
+     *
+     * 上游按「ID / Request-ID / Message-ID 是否齐全」做渠道校验，缺任一头即
+     * 400 code=11-128 "conversation id missing"；2026-10-21 实测的 11128
+     * "request illegal"（displayTips「没通过渠道校验」）同属这一族。
+     *
+     * 该头同时是上游**前缀缓存槽**的实际来源，所以两个约束都不能丢：
+     *  - 按 uid 隔离：同一客户端会话打在不同账号上不能共用一个缓存槽；
+     *  - 跨轮稳定：每轮都变等于每轮都是新会话，前缀缓存与账号粘性同时失效。
+     *
+     * 空会话键（无 messages 可比对、面板探针等）现造一个 32 hex：上游只要求
+     * 「有值」，这类路径本来也没有会话状态可言。
+     */
+    fun conversationId(uid: String, sessionKey: String?): String {
+        val key = sessionKey?.trim().orEmpty()
+        // 无会话源（无 messages 可比对 / 面板探针）：现造一个 UUID v4 形态值。
+        // 上游同样如此（session.NewConversationID），只是不需要跨请求稳定。
+        if (key.isEmpty()) return uuidFor(uid, com.wb.api.core.Ids.randomHex(32), "")
+        return uuidFor(uid, key, "")
+    }
+
+    /**
+     * 由 (uid, 会话键 [, 用途]) 稳定派生 **UUID v4 形态**（36 字符带横线）。
+     *
+     * 为什么必须是这个形态（issue #51 真机取证）：官方 `X-Conversation-ID` 恒为
+     * `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`；旧实现 `wb2a-<uid8>-<hex>` 长 48、
+     * 自带项目缩写、还把账号 UID 前 8 位明文写进请求头与 body —— 三处都可与官方值
+     * 区分，等于自证网关身份。
+     *
+     * 语义不变：uid 仍参与哈希输入（跨账号绝不碰撞），同 (uid, 会话) 恒得同值
+     * （前缀缓存槽语义不变），[purpose] 用于同一会话需要多个互异稳定值时的域分隔
+     * （例如 X-Conversation-ID 与 acp-connection-id）。
+     *
+     * 版本/变体位按 RFC 4122 置位（第 7 字节 0x40、第 9 字节 0x80），否则
+     * `4xxx` / `89ab` 位置出现别的值，本身又成了一种可判别特征。
+     */
+    fun uuidFor(uid: String, key: String?, purpose: String = ""): String {
+        val input = uid + "|" + (key?.trim().orEmpty()) + if (purpose.isEmpty()) "" else "|$purpose"
+        val sum = MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
+        val u = sum.copyOf(16)
+        u[6] = ((u[6].toInt() and 0x0f) or 0x40).toByte()
+        u[8] = ((u[8].toInt() and 0x3f) or 0x80).toByte()
+        val hex = u.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) +
+            "-" + hex.substring(16, 20) + "-" + hex.substring(20, 32)
+    }
+
+    /**
+     * 官方形态的消息/请求 ID：32 位小写 hex，**前 12 位是毫秒时间戳**。
+     *
+     * 官方真机样本 `01a160b2b722740da9b34be7d909a6ed`（5.8.4，2026-10-22 抓包）：
+     * 前 48 bit 解出 1792623687458 ms，正是该次发送的时刻，且同会话内严格单调。
+     * 纯随机 ID 按时间排序是乱的，本身构成一种可聚类的批次特征（issue #51）。
+     */
+    fun messageId(): String =
+        "%012x".format(System.currentTimeMillis()) + com.wb.api.core.Ids.randomHex(20)
+
+    /** 纯随机 32 hex（X-Trace-ID / B3 TraceId）：官方这两个值与 request id 恒不相等。 */
+    fun traceId(): String = com.wb.api.core.Ids.randomHex(32)
+
+    /** 纯随机 16 hex（B3 SpanId / ParentSpanId）：官方 span 与 trace、request 均无关系。 */
+    fun spanId(): String = com.wb.api.core.Ids.randomHex(16)
+
+    /**
+     * B3 TraceId 合法性：只认 16 / 32 位 hex。
+     *
+     * B3 规范如此；把任意形状的值（带横线 / 超长 / 非 hex）塞进 X-B3-TraceId
+     * 会破坏上游的链路关联，所以非法时调用方回落到恒 32 hex 的消息级 ID。
+     */
+    fun validTraceId(s: String): Boolean {
+        if (s.length != 16 && s.length != 32) return false
+        return s.all { (it in '0'..'9') || (it in 'a'..'f') || (it in 'A'..'F') }
+    }
 }
+
+/**
+ * chat 出站的会话头族参数（对齐新上游 `upstream.ChatMeta` + `injectConversationHeaders`）。
+ *
+ * 为什么需要它：上游把「官方客户端会发的那组会话头」当作**渠道校验**的一部分，
+ * 一个都不发（旧实现就是如此）会被判成非官方客户端 → 400 code=11-128 / 11128。
+ *
+ * 各字段职责不同，一个都不能省：
+ *  - [clientConversationId]：客户端在 body 里声明的 `conversation_id`，**原值透传**
+ *    （上游要求透传优先，同时它是前缀缓存槽来源）；
+ *  - [sessionKey]：网关派生的会话键，客户端没声明时用它 + uid 派生 X-Conversation-ID；
+ *  - [turnId]：**轮级聚合主键**，一次下游请求生成一次，轮转 / 换号 / 重试全部复用，
+ *    上游后台按它把「一次用户发送」内的多次上游请求聚合成一条；
+ *  - [traceId]：入站 `X-Trace-ID` 透传，空则回落轮级 ID。
+ *
+ * 消息级 ID（X-Conversation-Message-ID / X-Request-ID / B3 SpanId）每条出站独立生成，
+ * 属于传输层细节，不放进这个数据类。
+ */
+data class ConvIds(
+    val clientConversationId: String = "",
+    val sessionKey: String = "",
+    val turnId: String = "",
+    val traceId: String = "",
+)
 
 class UpstreamException(val kind: ErrKind, val status: Int, val body: String) : Exception(body)
 
 enum class ErrKind {
     NONE, HARD_CREDIT, SOFT_RATE, SESSION_DEAD, NOT_FOUND, SERVER,
     CONTENT_BLOCKED, BAD_PARAMS, ACCOUNT_FAULT, MODEL_BLOCKED,
-    WAF_BLOCK, PROMPT_TOO_LONG, IMAGE_INVALID, CLIENT
+    WAF_BLOCK, PROMPT_TOO_LONG, IMAGE_INVALID, CLIENT,
+
+    /**
+     * 14003「模型繁忙」（官方文案「当前模型请求繁忙，请切换模型或稍后重试」）。
+     *
+     * 与 SOFT_RATE 的分野是**瞬时 vs 持续**：生产日志里同一分钟内既有 14003 也有成功
+     * （上游 issue #46），按 soft_rate 家族（600s 起、翻倍、封顶 2h）罚号会把 10 秒
+     * 抖动放大成整分钟客户端可见的断流。处置：**模型级**短冷却 10s 起、翻倍、封顶 60s，
+     * 不碰账号级、不换号（换号打同一个模型同样繁忙）。
+     */
+    MODEL_BUSY,
+
+    /**
+     * 上游**渠道校验**拦截（400 code=11-128 / 11128，msg "request illegal"）。
+     *
+     * 语义是「这次调用没通过渠道校验，可能不是官方客户端发出的，请重新发送」——
+     * 上游自己把它归为**请求级可重试信号**，不是账号被封。处置：软冷却 + 继续轮转，
+     * **绝不 Disable**（新上游 17b5204：误禁用 = 永久丢号 + 人工解冻，误软冷却 =
+     * 短暂轮换 + 退避自愈，两者代价不对称）。
+     */
+    CHANNEL_BLOCK,
 }
 
 data class DeviceAuth(val state: String, val authUrl: String, val realm: String)
@@ -225,18 +377,29 @@ class UpstreamClient(
     // ---------- 请求头 ----------
 
     /**
-     * 按端点族注入请求头（对齐 Go 的 CommonHeaders / BillingHeaders）：
-     *  - 共用：Content-Type / Accept / X-CodeBuddy-Request:1 / Accept-Language / X-User-Id / 设备与域头
-     *  - chat/models：额外 Origin/Referer/X-Requested-With + 三段式 WorkBuddy UA
-     *  - billing：不加 Origin/Referer，UA 为单段 `WorkBuddy/5.5.4`
+     * 按端点族注入请求头（对齐 Go 的 CommonHeaders / BillingHeaders / ChatHeaders）：
+     *  - 共用（REST 层）：Content-Type / Accept / X-CodeBuddy-Request:1 / Accept-Language /
+     *    X-User-Id / X-Machine-ID / X-Session-ID / Origin / Referer / 设备与域头
+     *  - models：同 REST 层（`/v3/config` 需要 Origin/Referer 与三段式 UA）
+     *  - billing：不加 Origin/Referer，UA 为单段 `WorkBuddy/<ver>`
+     *  - chat：**在共用头之上反而要删掉** Origin / Referer / Accept-Language /
+     *    X-Machine-ID / X-Session-ID / X-No-* —— 官方 chat 走 openai-node SDK，
+     *    这几个头客户端从不发，多发一个就是一处可判别特征（见下方 chat 分支）
      */
-    private fun applyHeaders(b: Request.Builder, realm: String, auth: AuthEntry?, billing: Boolean, chat: Boolean = false) {
+    private fun applyHeaders(
+        b: Request.Builder,
+        realm: String,
+        auth: AuthEntry?,
+        billing: Boolean,
+        chat: Boolean = false,
+        conv: ConvIds? = null,
+    ) {
         b.header("Content-Type", "application/json")
         b.header("X-CodeBuddy-Request", "1")
-        b.header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
+        b.header("Accept-Language", "zh")   // 跟随系统区域，不按账号域切（新上游实测口径）
         if (billing) {
             b.header("Accept", "application/json")
-            b.header("User-Agent", if (userAgentOverride.isNotBlank()) userAgentOverride else Up.billingUA())
+            b.header("User-Agent", if (userAgentOverride.isNotBlank()) userAgentOverride else Up.billingUA(realm))
         } else {
             b.header("Accept", "application/json, */*")
             val origin = Up.origin(realm)
@@ -256,7 +419,8 @@ class UpstreamClient(
                 b.header("X-Enterprise-Id", auth.enterprise_id)
                 b.header("X-Tenant-Id", auth.enterprise_id)
             } else if (!billing) {
-                // 对齐 Go ChatHeaders：个人账号无企业时显式声明（billing 域不注入，同 Go）。
+                // REST 层沿用 CodeBuddy CLI 的「无企业」哨兵头；**chat 域随后会删掉**
+                // （WorkBuddy 桌面端个人号两个方向都不发 X-No-*，见 chat 分支）。
                 b.header("X-No-Enterprise-Id", "1")
             }
             // X-Domain 按域分发（对齐上游 CommonHeaders + injectGlobalChatHeaders）：
@@ -264,11 +428,14 @@ class UpstreamClient(
             //    对齐 intl 客户端出站头；缺失会被国际版风控按「可疑域」判定）；
             //  - 其余：用账号落盘 domain，没有则声明「无部门信息」。
             if (chat && realm == "global") {
+                // global 只声明 X-Domain；X-No-Enterprise-Id 在 chat 分支会被删掉
+                // （真机实测个人号不发哨兵头）。
                 b.header("X-No-Enterprise-Id", "1")
                 b.header("X-Domain", "www.workbuddy.ai")
             } else if (auth.domain.isNotBlank()) {
                 b.header("X-Domain", auth.domain)
             } else if (!billing) {
+                // 同上：REST 层哨兵头，chat 域会删除。
                 b.header("X-No-Department-Info", "1")
             }
             if (auth.device_token.isNotBlank()) b.header("X-Device-Token", auth.device_token)
@@ -277,11 +444,89 @@ class UpstreamClient(
         // 缺了它们，上游后台会把请求归因成「client/agentPurpose 为空」的网关特征。
         // 仅 chat 路径注入（billing / models 域不带，与上游一致）。
         if (chat) {
+            // ── chat 域头族：逐头对齐新上游 headers.go（2026-10-22 issue #51 两版真机对照）──
+            //
+            // 与 REST 域（models / billing）的差异不是漏写，而是官方客户端形态：chat 走
+            // openai-node SDK，没有浏览器语义，因此**不发**下面这几个头。旧实现把它们当
+            // 「通用头」全带上，每一个都是一处可判别特征：
+            //   Origin / Referer          ← CLI/SDK 没有 Origin 语义
+            //   Accept-Language           ← 桌面端 chat 不发（billing 层才偶发 zh）
+            //   X-Machine-ID/X-Session-ID ← 网关自造的 36 hex 派生值，客户端没有
+            //   X-No-Enterprise-Id / X-No-Department-Info ← CodeBuddy CLI 的约定，
+            //     WorkBuddy 桌面端个人号两个方向都不发哨兵头
+            b.removeHeader("Origin")
+            b.removeHeader("Referer")
+            b.removeHeader("Accept-Language")
+            b.removeHeader("X-Machine-ID")
+            b.removeHeader("X-Session-ID")
+            b.removeHeader("X-No-Enterprise-Id")
+            b.removeHeader("X-No-Department-Info")
+            // Accept 与官方一致：只发 application/json，照样收 SSE 流（两版实测）。
+            b.header("Accept", "application/json")
+            // 用量归属：X-Product 是 **SKU 段**，官方两版实测恒为 "SaaS"；产品名只在
+            // X-IDE-Name/Type。旧实现让 X-Product 也取产品名 ——「同名不同值」比多一个
+            // 头更容易被规则命中。
             b.header("X-Agent-Purpose", "conversation")
             b.header("X-IDE-Name", "WorkBuddy")
             b.header("X-IDE-Type", "WorkBuddy")
-            b.header("X-IDE-Version", Up.DEFAULT_CLIENT_VERSION)
-            b.header("X-Product", "WorkBuddy")
+            b.header("X-IDE-Version", Up.clientVersion(realm))
+            b.header("X-Product", "SaaS")
+            // 官方 chat 出站恒带：语义是「请求含私有数据」，客户端无条件声明。
+            b.header("X-Private-Data", "true")
+            // SDK / agent 段：官方 openai-node 自动加，两版真机完全一致（同为 6.25.0 /
+            // node v22.21.1）。网关是 Kotlin 实现没有对应运行时，按实测值固定 ——
+            // 不发这几个头，上游看到的是一份「缺了 SDK 段」的残缺头集合。
+            b.header("X-Agent-Type", "main")
+            b.header("X-Agent-Intent", "craft")
+            b.header("X-Stainless-Lang", "js")
+            b.header("X-Stainless-Package-Version", "6.25.0")
+            b.header("X-Stainless-OS", "Windows")
+            b.header("X-Stainless-Arch", "x64")
+            b.header("X-Stainless-Runtime", "node")
+            b.header("X-Stainless-Runtime-Version", "v22.21.1")
+            b.header("X-Stainless-Retry-Count", "0")
+
+            // ── 会话头族（渠道校验三件套 + 链路族）──
+            // 缺任一头，上游 400 code=11-128 "conversation id missing"；一个都不发时
+            // 实测得到 11128 "request illegal" + displayTips「没通过渠道校验」。
+            val msgId = Up.messageId()
+            val turnId = conv?.turnId?.takeIf { it.isNotBlank() } ?: Up.messageId()
+            val convId = conv?.clientConversationId?.takeIf { it.isNotBlank() }
+                ?: Up.conversationId(auth?.uid.orEmpty(), conv?.sessionKey)
+            // X-Trace-ID **不**回落 request id：真机实测两族恒不相等（一条独立 32 hex），
+            // 旧实现空则回落，反而让 trace 与 request 恒等 —— 是「网关自造」的可见痕迹。
+            val trId = conv?.traceId?.takeIf { it.isNotBlank() } ?: Up.traceId()
+            // SpanId / ParentSpanId 各自独立随机：官方 span 与 trace、request 无关；
+            // 曾用 messageID[:16]，会把消息 ID 的 12 hex 时间前缀一起带出来。
+            val spanId = Up.spanId()
+            val parentId = Up.spanId()
+            b.header("X-Conversation-ID", convId)
+            b.header("X-Conversation-Request-ID", turnId)
+            b.header("X-Conversation-Message-ID", msgId)
+            b.header("X-Request-ID", msgId)
+            b.header("X-Root-Request-ID", turnId)
+            b.header("X-Trace-ID", trId)
+            // B3 TraceId 跟随 trace（官方 X-B3-TraceId == X-Trace-ID）；入站透传值非法
+            // （含横线/超长/非 hex）时回落消息级 ID（恒 32 hex，必为合法 B3 TraceId）。
+            val b3Trace = if (Up.validTraceId(trId)) trId else msgId
+            b.header("X-B3-TraceId", b3Trace)
+            b.header("X-B3-SpanId", spanId)
+            b.header("X-B3-ParentSpanId", parentId)
+            b.header("X-B3-Sampled", "1")
+            // 单头 b3 与 W3C traceparent：官方两版都双发，缺它们只剩三件套，
+            // 而客户端从不只发三件套。
+            b.header("b3", b3Trace + "-" + spanId + "-1-" + parentId)
+            b.header("traceparent", "00-" + b3Trace + "-" + spanId + "-01")
+            // acp-connection-id：官方把它列进标准出站头族（与 X-Conversation-ID 同批设置），
+            // 值是会话注册表的 acpConnectionId —— 同会话稳定、与 X-Conversation-ID 不同值。
+            // 网关没有 ACP 连接层，按「同 (账号, 会话) 稳定 + 不同域」派生，语义一致。
+            val sessSrc = conv?.sessionKey?.takeIf { it.isNotBlank() }
+                ?: conv?.clientConversationId?.takeIf { it.isNotBlank() }
+            b.header(
+                "acp-connection-id",
+                if (sessSrc != null) Up.uuidFor(auth?.uid.orEmpty(), sessSrc, "acp")
+                else Up.uuidFor("", Up.traceId(), "acp"),
+            )
         }
     }
 
@@ -539,10 +784,13 @@ class UpstreamClient(
      * （不再回落任何静态名单 —— 与上游「纯动态、无兜底」的产品决策一致）。
      */
     suspend fun fetchModels(realm: String, auth: AuthEntry): List<JsonObject> = withContext(Dispatchers.IO) {
+        // 追加官方现有两种 UA 形态（三段式 + 两段式 Lite）作为**纯增量**探测路：
+        // 合并按 id 去重、只在多不在少，可兜住「旧 UA 被上游收紧后目录变空」。
+        val lite = Up.workBuddyUaLite(realm)
         val v3UAs = if (realm == "global") {
-            listOf(Up.workBuddyUA(realm), Up.UA_IDE, Up.UA_CLI)
+            listOf(Up.workBuddyUA(realm), lite, Up.UA_IDE, Up.UA_CLI)
         } else {
-            listOf(Up.UA_IDE)
+            listOf(Up.workBuddyUA(realm), lite, Up.UA_IDE)
         }
         val enterprisePaths = if (realm == "global") {
             listOf(Up.P_MODELS_BIZ2, Up.P_MODELS_BIZ)
@@ -605,7 +853,7 @@ class UpstreamClient(
             b.header("X-Requested-With", "XMLHttpRequest")
             b.header("Content-Type", "application/json")
             b.header("X-CodeBuddy-Request", "1")
-            b.header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
+            b.header("Accept-Language", "zh")   // 跟随系统区域，不按账号域切（新上游实测口径）
             if (auth.access_token.isNotBlank()) b.header("Authorization", "Bearer ${auth.access_token}")
             if (auth.uid.isNotBlank()) b.header("X-User-Id", auth.uid)
             b.header("X-Domain", v3Domain(auth))
@@ -644,7 +892,7 @@ class UpstreamClient(
                 b.header("Accept", "application/json, text/plain, */*")
                 b.header("X-Requested-With", "XMLHttpRequest")
                 b.header("X-CodeBuddy-Request", "1")
-                b.header("Accept-Language", if (realm == "global") "en-US" else "zh-CN")
+                b.header("Accept-Language", "zh")   // 跟随系统区域，不按账号域切（新上游实测口径）
                 if (auth.access_token.isNotBlank()) b.header("Authorization", "Bearer ${auth.access_token}")
                 if (auth.uid.isNotBlank()) b.header("X-User-Id", auth.uid)
                 b.header("X-Domain", v3Domain(auth))
@@ -716,7 +964,12 @@ class UpstreamClient(
     // ---------- 聊天 ----------
 
     /** 发起聊天，返回原始 OkHttp Response（调用方负责读流与关闭）。 */
-    suspend fun chat(auth: AuthEntry, bodyText: String, clientIp: String?): Response = withContext(Dispatchers.IO) {
+    suspend fun chat(
+        auth: AuthEntry,
+        bodyText: String,
+        clientIp: String?,
+        conv: ConvIds = ConvIds(),
+    ): Response = withContext(Dispatchers.IO) {
         val realm = auth.realm
         var last: Response? = null
         for (base in Up.chatBases(realm)) {
@@ -725,8 +978,10 @@ class UpstreamClient(
                 .post(bodyText.toRequestBody(mediaJson))
                 .apply {
                     // chat 域：在通用头之上叠加 global 专属域声明与用量归属头（见 applyHeaders）。
-                    applyHeaders(this, realm, auth, billing = false, chat = true)
-                    header("Accept", "application/json, text/event-stream")
+                    applyHeaders(this, realm, auth, billing = false, chat = true, conv = conv)
+                    // 官方 chat 只发 application/json（照样收 SSE）；多带
+                    // ", text/event-stream" 是自造形态（issue #51 两版实测）。
+                    header("Accept", "application/json")
                     // SSE 首字延迟：**不要**让中间层对 event-stream 做 gzip 缓冲——
                     // 压缩器要攒够一个块才吐字节，会把 TTFT 从几十毫秒推到几百毫秒。
                     // 显式声明 identity 即关闭压缩（上游是 Go net/http，正常遵守该声明）；
@@ -1458,17 +1713,92 @@ object Classify {
     private val softRateMarkers = listOf("rate limit", "rate-limiting", "too many requests", "限流", "请求过于频繁")
     private val sessionDeadMarkers = listOf("12153", "session dead", "token expired", "invalid token", "登录过期")
     private val accountFaultMarkers = listOf("11140", "request illegal", "14017", "trial not activated")
-    private val contentBlockedMarkers = listOf("风险", "违规内容", "content policy", "content_filter", "sensitive")
+    private val contentBlockedMarkers = listOf(
+        "风险", "违规内容", "content policy", "content_filter", "sensitive",
+        // 11128 的另一种形态（新上游 client_test：{"code":11128,"msg":"blocked by security policy"}
+        // → ErrContentBlocked）。它不是渠道校验（msg 里没有渠道文案），属**零动作**的内容误报，
+        // 不能因为 code 相同就被 isChannelBlock 当成渠道拦截，也不能落进 CLIENT 去降权。
+        "security policy", "blocked by security",
+    )
     private val promptTooLongMarkers = listOf("11115", "prompt is too long", "context length")
     private val invalidImageMarkers = listOf("11133", "invalid image", "image format", "unsupported image", "图片格式")
     /** 请求体解析失败（HTTP 400 + `"code":11101` / "Unmarshal chat params failed"）→ 请求级确定性错误。 */
     private val badParamsMarkers = listOf("11101", "unmarshal chat params failed")
+
+    /**
+     * 渠道校验拦截的业务码。上游有**两种**编码形态，必须都认：
+     *  - 字符串 `"11-128"`（新上游 handler.go:1823 与 17b5204 提交取证的真实形态）；
+     *  - 数字 `11128`（同一拦截的另一编码；2026-10-21 实测报文为 code 11128 +
+     *    msg "request illegal" + displayTips「这次调用没通过渠道校验」）。
+     *
+     * 只按数字判会漏掉字符串形态，只按字符串判会漏掉实测现场 —— 两者都要。
+     */
+    private val channelBlockCodes = listOf("11-128", "11128")
+
+    /** msg 侧判据：这些文案都属于「渠道校验 / 反探测」这一族，而不是账号授权故障。 */
+    private val channelBlockTexts = listOf(
+        "request illegal",           // 实测形态（11128 / 11-128 共用该 msg）
+        "unapproved channel",        // 首条 developer
+        "conversation id missing",   // 三件套缺头
+        "not system prompt",         // 首条不是 system
+        "channel verification",      // 文案兜底
+        "渠道校验",
+    )
+
+    /** `"code":N` / `"code": N` / `"code":"N"` / `"code": "N"` 的空白容差匹配（lower 须为小写）。 */
+    private fun codeMarker(lower: String, code: String): Boolean {
+        val q = "\""
+        return lower.contains(q + "code" + q + ":" + code) ||
+            lower.contains(q + "code" + q + ": " + code) ||
+            lower.contains(q + "code" + q + ":" + q + code + q) ||
+            lower.contains(q + "code" + q + ": " + q + code + q)
+    }
+
+    /**
+     * 渠道校验拦截判据（`ErrKind.CHANNEL_BLOCK` 的唯一入口）。
+     *
+     * 判据**必须同时**要求「业务码命中」与「msg 属于渠道文案」：
+     *  - 只看 msg："request illegal" 也出现在 11140（账号级授权风控，必须硬禁用）；
+     *  - 只看 code：11128 也用于内容审核（`{"code":11128,"msg":"blocked by security policy"}`，
+     *    新上游 client_test 的 ErrContentBlocked 用例）—— 那属零动作，不该软冷却。
+     * 两者同时成立才是「渠道校验」。
+     */
+    /**
+     * 14003 模型繁忙判据：结构化 code 主判，官方中文/英文文案兜底（上游 issue #46）。
+     *
+     * 只在 4xx/429 语境使用（见 [of] 的调用位置）；5xx 属服务端故障优先，不在此列。
+     */
+    fun isModelBusy(body: String): Boolean {
+        val b = body.lowercase().replace("\\", "")
+        if (codeMarker(b, "14003")) return true
+        return b.contains("模型繁忙") || b.contains("请求繁忙") || b.contains("model busy") ||
+            b.contains("model is busy") || b.contains("currently busy")
+    }
+
+    fun isChannelBlock(body: String): Boolean {
+        // 去掉反斜杠再判：SSE error 帧与网关 sendError 会把上游信封**再序列化一层**，
+        // 于是 `"code":11128` 以 `\"code\":11128` 的形态出现（实测报文就是这样）。
+        // 只在本函数内做，不影响其它分类判据的原文语义。
+        val b = body.lowercase().replace("\\", "")
+        if (!b.contains("\"code\"")) return false
+        if (channelBlockCodes.none { codeMarker(b, it) }) return false
+        return channelBlockTexts.any { b.contains(it) }
+    }
 
     fun of(status: Int, body: String): ErrKind {
         val b = body.lowercase()
         return when {
             // 0. 11102「该后端无此模型」
             (status == 400 || status == 404) && b.contains("11102") -> ErrKind.MODEL_BLOCKED
+            // 0.5 渠道校验拦截（11-128 / 11128 "request illegal"）
+            //
+            // 必须排在 accountFaultMarkers 之前：后者的 "request illegal" 判据会把这一类
+            // 也吞成 ACCOUNT_FAULT → 旧实现据此 **Disable** 账号（把健康号永久踢出池子），
+            // 一次渠道校验失败就把整池打空，表象就是「所有请求 503 no_healthy_account」。
+            isChannelBlock(body) -> ErrKind.CHANNEL_BLOCK
+            // 0.6 14003 模型繁忙：**必须先于 429 兜底**，否则会被当成账号级限流
+            // （soft_rate 600s 起），把间歇抖动放大成整分钟不可用（上游 issue #46）。
+            isModelBusy(body) -> ErrKind.MODEL_BUSY
             // 1. 402 计费余额耗尽
             status == 402 -> ErrKind.HARD_CREDIT
             // 2. session 终态
@@ -1514,12 +1844,24 @@ object Classify {
      */
     fun frame(payload: String): ErrKind {
         if (RateLimit.isModelRateLimit(payload)) return ErrKind.SOFT_RATE
-        val msg = runCatching {
+        val err = runCatching {
             AppJson.parseToJsonElement(payload).jsonObject["error"]?.objOrNull()
-                ?.get("message")?.primText()
-        }.getOrNull().orEmpty()
+        }.getOrNull()
+        val msg = err?.get("message")?.primText().orEmpty()
         if (msg.isBlank()) return ErrKind.NONE
-        return of(400, msg)
+        // 把 `error.code` 拼回一个最小信封再分类：渠道校验（11-128 / 11128）与 11140
+        // **共用同一句** "request illegal"，只拿 message 判会把前者也归进 ACCOUNT_FAULT
+        // → 旧实现据此 Disable 账号（一次渠道拦截就把整池打空）。帧路径（SSE error 帧、
+        // 内嵌失败帧）的 code 因此必须参与判定，与 Classify.of 同口径。
+        val code = err?.get("code")?.primText()?.trim().orEmpty()
+        if (code.isBlank()) return of(400, msg)
+        val numeric = code.all { it.isDigit() }
+        val envelope = if (numeric) {
+            "{\"code\":" + code + ",\"msg\":\"" + msg + "\"}"
+        } else {
+            "{\"code\":\"" + code + "\",\"msg\":\"" + msg + "\"}"
+        }
+        return of(400, envelope)
     }
 }
 

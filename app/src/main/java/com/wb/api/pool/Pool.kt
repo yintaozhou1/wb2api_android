@@ -91,7 +91,34 @@ class AccountPool(
         store.loadAuths()
         val st = store.loadState()
         sticky.clear(); sticky.putAll(st.sticky)
+        recoverChannelBlocked()
         LogBus.log("loaded ${store.auths().size} account(s)")
+    }
+
+    /**
+     * 解除历史误判留下的**禁用**：`cool_kind == "account_banned"` 的唯一来源是
+     * 「ACCOUNT_FAULT + body 含 request illegal」→ Disable。而 1.6.4 及更早的实现
+     * 把上游的**渠道校验**（11-128 / 11128 "request illegal"）也判进了这条分支，
+     * 于是好号被永久踢出池子，用户升级后仍会看到 `503 no_healthy_account`。
+     *
+     * 这里在每次加载账号时做一次幂等自愈（无该类状态时零开销）：
+     *  - 真封禁（11140）在修复后的代码里仍会重新 Disable，故恢复是安全的 ——
+     *    最坏情况是多打一次请求再被禁回去，不会让真封禁的号长期留在池里；
+     *  - 不做这一步的话，用户必须手工逐个「启用」，等于把误判的代价永久留在设备上。
+     */
+    private fun recoverChannelBlocked() {
+        var n = 0
+        for (a in store.auths()) {
+            val s = store.stateOf(a.uid)
+            if (s.disabled && s.cool_kind == "account_banned") {
+                store.putState(s.copy(disabled = false, paused = false, cool_kind = "", cool_until = 0))
+                n++
+            }
+        }
+        if (n > 0) {
+            store.saveState(sticky)
+            LogBus.log("恢复 $n 个被渠道校验误禁用的账号（1.6.4 及更早的 ACCOUNT_FAULT 误判）")
+        }
     }
 
     fun accounts() = store.auths()
@@ -218,7 +245,7 @@ class AccountPool(
         cachedTokens: Long = 0,
         /** 首 token 等待（ms）。0 = 没有观测（非流式天然没有首帧）→ 速率不扣减。 */
         ttfbMs: Long = 0,
-    ) {
+    ) = store.withStateLock {
         val s = store.stateOf(uid)
         val tps = tokensPerSecond(tokens, latencyMs, ttfbMs)
         val prompt = promptTokens.coerceAtLeast(0)
@@ -279,6 +306,7 @@ class AccountPool(
     // ---------- 落盘节流 ----------
 
     /** 高频路径（成功请求）用：1s 内合并为一次整份写盘，避免每请求一次 IO。 */
+    @Synchronized
     private fun persistThrottled() {
         val nowMs = System.currentTimeMillis()
         if (nowMs - lastPersistMs < 1000L) { stateDirty = true; return }
@@ -312,10 +340,11 @@ class AccountPool(
      *   HARD_CREDIT → 冷却到次日 04:00；SOFT_RATE → 重置墙钟 / Retry-After / 有界退避；
      *   MODEL_BLOCKED → (账号,模型) 负缓存；NOT_FOUND → 固定短冷却；
      *   **SESSION_DEAD → 禁用**；**ACCOUNT_FAULT → 11140 禁用 / 其余软冷却**；
+     *   **CHANNEL_BLOCK（11-128 / 11128 渠道校验）→ 软冷却，绝不 Disable**；
      *   **WAF_BLOCK → 软冷却（60s 基数）**；**SERVER → 喂熔断（NoteError）**；
      *   **CLIENT → 连败降权（NoteFailures）**；其余零动作。
      */
-    fun onError(uid: String, kind: ErrKind, status: Int, model: String, body: String = "", retryAfterSec: Long = 0) {
+    fun onError(uid: String, kind: ErrKind, status: Int, model: String, body: String = "", retryAfterSec: Long = 0) = store.withStateLock {
         val s = store.stateOf(uid)
         val p = cfg()
         val t = now()
@@ -387,6 +416,39 @@ class AccountPool(
                 // 被选中、继续 12153，等于把「需要重新登录的终态」错当成一次临时抖动。
                 ns = ns.copy(disabled = true, paused = false, cool_kind = "session_dead")
                 log("session_dead/disable", uid, model, 0)
+            }
+            ErrKind.CHANNEL_BLOCK -> {
+                // 渠道校验拦截（11-128 / 11128 request illegal，见 Classify.isChannelBlock）：
+                // 上游自述「这次调用没通过渠道校验，可能不是官方客户端发出的，请重新发送」，
+                // 是**请求级可重试信号**，不是账号被封。处置对齐新上游 17b5204：
+                // 软冷却（soft_rate 基数 + soft_streak 指数、封顶 soft_rate_max），
+                // **不 Disable、不喂熔断** —— 上游解除标记 / 本端补齐指纹后自愈。
+                val base = Durations.parse(p.cooldown.soft_rate, 600)
+                val streak = s.soft_streak + 1
+                val cool = (base * (1L shl (streak - 1).coerceIn(0, 8))).coerceAtMost(cap)
+                ns = ns.copy(cool_until = t + cool, cool_kind = "channel_block", soft_streak = streak)
+                log("channel_block(keep account)", uid, model, cool)
+            }
+            ErrKind.MODEL_BUSY -> {
+                // 14003「模型繁忙」（上游 issue #46）：**模型级**短冷却，不碰账号级。
+                //
+                // 首档 10s、同 (号,模型) 反复命中翻倍、封顶 60s：生产日志显示上游繁忙是
+                // **间歇**的（同一分钟内既有 14003 也有成功），首档取分钟级会把 10 秒抖动
+                // 放大成整段客户端可见的断流。同一窗口内重复命中不延长（并发请求/兜底探测
+                // 会把窗口越堆越厚，与 soft_rate 的 held 语义一致）。
+                val prev = ns.rate_limited_models.firstOrNull { it.model == model && it.kind == "model_busy" }
+                if (prev != null && prev.until > t) {
+                    log("model_busy(held)", uid, model, prev.until - t)
+                } else {
+                    val hits = (prev?.hits ?: 0) + 1
+                    var cool = 10L
+                    var i = 1
+                    while (i < hits && cool < 60L) { cool *= 2; i++ }
+                    cool = minOf(cool, 60L)
+                    ns = ns.copy(rate_limited_models = ns.rate_limited_models.filter { it.model != model } +
+                        ModelLimit(model, "model_busy", reset_at = 0, until = t + cool, hits = hits, reason = why))
+                    log("model_busy", uid, model, cool)
+                }
             }
             ErrKind.ACCOUNT_FAULT -> {
                 // 上游 applyErrorPolicy 按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
@@ -462,7 +524,9 @@ class AccountPool(
             }
         }
         store.putState(ns)
-        store.saveState(sticky)
+        // 与成功路径同口径：错误风暴时**不要**每个请求都整份写盘 + fsync（那会拖慢本就
+        // 紧张的 HTTP 线程池）。1s 节流 + 调度器 flush 兜底，崩溃最多丢 1s 的计数。
+        persistThrottled()
     }
 
     /**
@@ -473,7 +537,7 @@ class AccountPool(
      * 连败 degrade_threshold 次才临时出池。原实现把它当 `ErrKind.SERVER` 走 onError → 喂
      * 熔断，于是上游网络一抖，健康账号就被熔断。
      */
-    fun onTransportFailure(uid: String, model: String, why: String) {
+    fun onTransportFailure(uid: String, model: String, why: String) = store.withStateLock {
         val s = store.stateOf(uid)
         val t = now()
         val (ns, cool) = degradeNext(s.copy(last_used_at = t), cfg().pool, t)
@@ -683,6 +747,9 @@ class AccountPool(
     // ---------- 会话粘性 ----------
 
     fun stickyGet(key: String): String? {
+        // 开关必须在这里生效：原先只有 stickyGC 看 enabled，关掉开关后选号仍然粘、
+        // 只是不再过期回收 —— 行为与用户预期相反，且 sticky map 会无限增长。
+        if (!cfg().session_sticky.enabled) return null
         val b = sticky[key] ?: return null
         val ttl = Durations.parse(cfg().session_sticky.ttl, 1800)
         if (now() - b.updated_at > ttl) { sticky.remove(key); return null }
@@ -690,15 +757,24 @@ class AccountPool(
     }
 
     fun stickyBind(key: String, uid: String) {
+        // 同 stickyGet：开关关闭时不再写入新绑定（否则关开关只是「不 GC」）。
+        if (!cfg().session_sticky.enabled) return
         sticky[key] = StickyBind(uid, now())
     }
 
     fun stickyUnbind(key: String) { sticky.remove(key) }
 
+    @Volatile private var stickyGcAt = 0L
+
     fun stickyGC() {
         if (!cfg().session_sticky.enabled) return
-        val ttl = Durations.parse(cfg().session_sticky.ttl, 1800)
         val t = now()
+        // gc_interval 原先是死配置（GC 只由调度器 60s 周期驱动）：现在按它自行节流，
+        // 用户把间隔调大就真的少扫（ttl 更短的过期项由 stickyGet 的懒过期兜住）。
+        val every = Durations.parse(cfg().session_sticky.gc_interval, 300)
+        if (every > 0 && t - stickyGcAt < every) return
+        stickyGcAt = t
+        val ttl = Durations.parse(cfg().session_sticky.ttl, 1800)
         sticky.entries.removeIf { t - it.value.updated_at > ttl }
     }
 
@@ -731,13 +807,17 @@ class AccountPool(
      * 只要有**任意**一个参与选号的账号还能服务该模型，就返回 blocked=false，
      * 让上层继续用原有的 no_healthy_account 文案。
      */
-    fun modelBlocked(model: String): ModelBlockStatus {
+    fun modelBlocked(model: String, realm: String = ""): ModelBlockStatus {
         if (model.isBlank()) return ModelBlockStatus()
         val t = now()
         var count = 0
         var reason = ""
         var until = 0L
         store.auths().forEach { a ->
+            // 选号是**分 realm** 的，判定也必须分 realm：否则 cn 号全被某模型冷却、
+            // global 号只因账号级冷却而选不到时，会被误报成「该模型全池不可用」，
+            // 诱导用户换掉本来可用的模型。
+            if (realm.isNotEmpty() && a.realm != realm) return@forEach
             val s = store.stateOf(a.uid)
             if (s.disabled || s.paused) return@forEach
             val lim = s.rate_limited_models.firstOrNull { it.model == model && it.until > t }
@@ -751,10 +831,35 @@ class AccountPool(
         return ModelBlockStatus(blocked = true, reason = reason, until = until, count = count)
     }
 
+    /**
+     * 「全池该模型只是忙」的等待建议（毫秒；0 = 不值得等）。
+     *
+     * 对齐新上游 issue #46（ecbd2f785 + 97ba22813）：判据**三条同时成立**才等 ——
+     *  1. 全池都被该模型的冷却挡住（[modelBlocked]）；
+     *  2. 原因是 14003 模型繁忙（11102「模型不存在」/11158 换号或等待都不会变好）；
+     *  3. 最早解封在 [capMs] 之内。
+     * 抖动只取**正向**（0 ~ +25%）：早醒一次等于白等（上游实测 4/8 → 8/8），
+     * 晚一点没有任何代价。
+     */
+    fun modelBusyWaitMs(model: String, capMs: Long, realm: String = ""): Long {
+        val st = modelBlocked(model, realm)
+        if (!st.blocked || st.until <= 0) return 0
+        val r = st.reason.lowercase()
+        val busy = r.contains("14003") || r.contains("model_busy") || r.contains("繁忙") || r.contains("busy")
+        if (!busy) return 0
+        val remain = st.until * 1000 - System.currentTimeMillis()
+        if (remain <= 0 || remain > capMs) return 0
+        return remain + (Math.random() * remain * 0.25).toLong()
+    }
+
     /** 某模型请求成功：清除 11102 负缓存（对齐 Go BlockModelClear）。 */
     fun clearModelBlock(uid: String, model: String) {
         val s = store.stateOf(uid)
-        val filtered = s.rate_limited_models.filterNot { it.model == model && it.kind == "model_unavailable" }
+        // 成功是「该模型此刻可服务」的最强证据：11102 负缓存与 14003 短冷却一起清
+        // （后者本就是 10~60s 的临时停车，成功即证明不必再等）。
+        val filtered = s.rate_limited_models.filterNot {
+            it.model == model && (it.kind == "model_unavailable" || it.kind == "model_busy")
+        }
         if (filtered.size != s.rate_limited_models.size) {
             store.putState(s.copy(rate_limited_models = filtered))
             store.saveState(sticky)

@@ -63,7 +63,8 @@ data class PanelCfg(val package_detail_limit: Int = 5)
  * 请求归档（原「请求归档」开关，语义不清晰，现改为可细调的一组选项）：
  * - request_archive_enabled: 总开关
  * - request_client_info: 是否记录客户端 IP / UA（隐私相关，可关）
- * - request_retention_days: 归档文件保留天数，超期自动清理
+ * - request_retention_days: **预留字段**（当前实现只按容量裁剪、不按天清理；保留字段
+ *   以兼容旧配置，不要让 UI 或注释承诺「超期自动清理」）
  * - request_archive_max_mb: 归档文件容量上限（MB），超出后按最旧优先丢弃
  * - request_body_log: 是否额外记录出站请求体摘要（默认关，仅排查时打开）
  */
@@ -174,6 +175,13 @@ data class PoolCfg(
     val prefer_expiring: Boolean = true,
     val expiring_soon: String = "168h",
     val cost_explore_interval: String = "30m",
+    /**
+     * 积分保底：**当前仅展示**（`/status` 回显），未参与选号。
+     *
+     * 不接入选号的理由：账号余额在「尚未刷新」时是 0（不是未知），按 floor 过滤会把
+     * 新加账号整批排除，代价远大于收益（真正的 402 由 HARD_CREDIT 分支冷却到次日）。
+     * 旧注释把它写成「选号失败成因」，与实现不符，一并纠正。
+     */
     val credit_floor: Long = 100,
 )
 

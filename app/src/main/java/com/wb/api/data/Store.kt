@@ -166,6 +166,22 @@ class Store(private val context: Context) {
 
     fun putState(s: AccountState) { stateCache[s.uid] = s }
 
+    /**
+     * 池状态**读-改-写**的临界区。
+     *
+     * 为什么需要：`stateOf` 返回的是不可变快照、`putState` 整体覆盖 —— 「读 → 计算 →
+     * 写」三步若不加锁，同一账号的两个并发请求（`max_in_flight` 默认 5）会互相覆盖：
+     * A 读到旧快照，B 刚写入 `cool_until`，A 再把自己基于旧快照的 copy 写回 →
+     * **冷却被静默抹掉、`disabled` 可被回滚、计数与模型台账丢更新**。
+     * `@Synchronized` 原先只保护 `saveState`（落盘），不保护内存态。
+     *
+     * 用法：`store.withStateLock { val s = stateOf(uid); ...; putState(ns) }`。
+     * 同一线程可重入（JVM 监视器可重入），所以内部再调 `saveState`（同样
+     * `@Synchronized`）不会死锁。临界区内只做内存读写与节流落盘，不做网络/长等待。
+     */
+    @Synchronized
+    fun <T> withStateLock(block: () -> T): T = block()
+
     @Synchronized
     fun saveState(sticky: Map<String, com.wb.api.model.StickyBind> = state.sticky) {
         state = PoolStateFile(accounts = stateCache.toMap(), sticky = sticky, usage_seq = state.usage_seq)
@@ -301,8 +317,43 @@ class Store(private val context: Context) {
 
     fun readRequestLogs(limit: Int = 200): List<String> {
         flushRequestLog()
-        if (!requestLogFile.exists()) return emptyList()
-        return requestLogFile.readLines().takeLast(limit)
+        if (!requestLogFile.exists() || limit <= 0) return emptyList()
+        // 自文件尾**按块反向读**：归档上限 100MB，而 `readLines().takeLast(200)` 会把
+        // 整份文件读成 List<String>（堆上可达数百 MB）—— 只为拿最后 200 行。
+        // 与裁剪路径（trimIfOversizeLocked）同一思路：内存占用与文件大小无关。
+        val out = java.util.ArrayDeque<String>()
+        runCatching {
+            java.io.RandomAccessFile(requestLogFile, "r").use { raf ->
+                var pos = raf.length()
+                val chunk = ByteArray(8192)
+                var carry = ByteArray(0)   // 尚未成行的前缀字节（跨块边界保留）
+                while (pos > 0 && out.size < limit) {
+                    val read = minOf(chunk.size.toLong(), pos).toInt()
+                    pos -= read
+                    raf.seek(pos)
+                    raf.readFully(chunk, 0, read)
+                    val buf = ByteArray(read + carry.size)
+                    System.arraycopy(chunk, 0, buf, 0, read)
+                    System.arraycopy(carry, 0, buf, read, carry.size)
+                    var end = buf.size
+                    var i = buf.size - 1
+                    while (i >= 0 && out.size < limit) {
+                        if (buf[i] == '\n'.code.toByte()) {
+                            val line = String(buf, i + 1, end - i - 1, Charsets.UTF_8)
+                            if (line.isNotEmpty()) out.addFirst(line)
+                            end = i
+                        }
+                        i--
+                    }
+                    carry = buf.copyOf(end)
+                }
+                if (carry.isNotEmpty() && out.size < limit) {
+                    val line = String(carry, Charsets.UTF_8)
+                    if (line.isNotEmpty()) out.addFirst(line)
+                }
+            }
+        }.onFailure { LogBus.log("[sys] 读取归档失败：${it.message}") }
+        return out.toList()
     }
 
     /**

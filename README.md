@@ -5,7 +5,9 @@
 对外提供 `/v1/chat/completions`、`/v1/responses`、`/v1/models` 等标准端点，
 供 Claude Code、Cherry Studio、OpenWebUI、Cline 等任意 OpenAI 兼容客户端接入。
 
-- **上游项目**：[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
+- **上游项目**：[misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)
+  （接续 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)；
+  后者已于 2026-10-21 停止维护，本工程的协议对齐以仍在维护的接力分支为基准）
 - **本工程定位**：上游 Go 网关的原生 Android 移植与重构（Kotlin 实现，非套壳、非 HTML UI）
 
 ---
@@ -29,6 +31,49 @@
 - **可观测性**：分频道日志（全部／对话／任务／系统）、运行指标、token 用量与缓存命中率。
 - **请求归档**：请求级 JSONL 归档，支持保留天数／容量上限／客户端信息开关与导出到设备。
 - **界面**：Jetpack Compose + Miuix，支持明暗主题、液态玻璃浮层与本地化（zh / en）。
+
+---
+
+---
+
+## 版本与更新日志
+
+### 1.6.6（versionCode 45）
+跟进上游 2026-10-22 连续三个发版（issue #51 头族对齐 / #46 模型繁忙 / 空回复救援）：
+
+- **出站头族与标识按两版真机取证对齐**：`X-Conversation-ID` 改 UUID v4 形态（36 字符带横线）、
+  消息级 ID 带毫秒时间位、`X-Trace-ID` 与 B3 `SpanId` 改为独立随机、补齐
+  `X-B3-ParentSpanId` / 单头 `b3` / `traceparent` / `acp-connection-id` / 7 个 `x-stainless-*`；
+  `X-Product` 改 `SaaS`；chat 域**删掉**官方从不发的 `Origin` / `Referer` / `Accept-Language` /
+  `X-Machine-ID` / `X-Session-ID` / `X-No-*`；body 侧补 `conversationRequestId`（头体一致）。
+- **14003「模型繁忙」**：模型级短冷却（10s 起、翻倍、封顶 60s），全池被挡时先等一次（≤10s），
+  仍不可用返回 `503 model_busy` + `Retry-After` —— 不再按 429 罚号 600s（那会把 10 秒抖动
+  放大成整分钟不可用）。
+- **空回复预防**：输出额度在 16~399 且客户端未显式要求思考时不注入 thinking（上游实测该区间
+  思考会吃光预算、正文 0 字节，日志表现为 `finish_reason=length` 的空回复）。
+- **审计修复**：Responses 流式错误帧漏 `sent=true`（会重复打上游并记多次错误）、
+  池状态读-改-写竞态（冷却可能被并发覆盖）、HTTP 请求行/头条数无上限（OOM 风险）、
+  归档读取改为自尾反向读、粘性开关真正生效、模型阻塞判定分 realm、错误路径落盘走节流、
+  chunked 负长度与空块保护。
+
+### 1.6.5（versionCode 44）
+修复「渠道校验」导致的大面积调用失败（上游 `400 code=11128/11-128 request illegal`）：
+
+- 补会话头族三件套 `X-Conversation-ID` / `X-Conversation-Request-ID` /
+  `X-Conversation-Message-ID`（上游按三件套是否齐全做渠道校验，缺任一头即 400）；
+- `messages[0]` 兜底为 `system`（首条 `user` 会被判 `first message is not system prompt`，
+  首条 `developer` 判 `unapproved channel`）；
+- 渠道校验不再被误判成账号封禁（旧实现会 `Disable` 健康号 → 整池 `503`），改软冷却，
+  并自动解除历史误禁用；
+- 非流式聚合补认「内嵌失败帧」（HTTP 200 + 顶层 `{code,msg}`）。
+
+### 1.6.4（versionCode 43）
+跟随上游接力分支（原直接上游停止维护）完成协议对齐：
+
+- 出站指纹：CN 客户端 5.8.3 / global 5.8.4、CLI 2.161.0、`workbuddy-ai` 品牌、`X-Private-Data`；
+- SSE 内嵌失败帧归一、断流如实上报 `finish_reason=length`；
+- 空名 `tool_call` 连同结果成对剔除（否则整条会话每轮 400）；
+- 新增 DSML 原生工具调用标记还原 —— DeepSeek 系「工具调用没执行、任务停在半路」的根因修复。
 
 ---
 
