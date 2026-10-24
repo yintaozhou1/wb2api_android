@@ -12,6 +12,8 @@ import com.wb.api.model.AuthEntry
 import com.wb.api.model.UsageRecord
 import com.wb.api.upstream.Classify
 import com.wb.api.upstream.ConvIds
+import com.wb.api.upstream.SessionProof
+import com.wb.api.upstream.SessionVerdict
 import com.wb.api.upstream.Dsml
 import com.wb.api.upstream.ErrKind
 import com.wb.api.upstream.Rewrite
@@ -222,12 +224,14 @@ object ChatHandler {
                     break
                 }
                 tried += auth.uid
-                Gateway.pool.acquire(auth.uid)
+                // 临期先续（避免把「token 自然过期」当成账号故障走一遍 401 求证）。
+                val live = ensureFreshToken(auth)
+                Gateway.pool.acquire(live.uid)
                 try {
                     val outbound = Rewrite.finalize(prepared, auth.uid, sessionKey, conv.turnId)
                     if (attempt == 0) LogBus.log(outboundSummary(prepared, realm, model, auth.uid, stream))
                     val resp = try {
-                        runBlocking { Gateway.upstream.chat(auth, outbound, req.clientIp, conv) }
+                        runBlocking { Gateway.upstream.chat(live, outbound, req.clientIp, conv) }
                     } catch (e: Throwable) {
                         val why = e.message ?: e.javaClass.simpleName
                         lastKind = ErrKind.SERVER; lastStatus = 502
@@ -264,7 +268,7 @@ object ChatHandler {
                         val retryAfter = resp.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L
                         val kind = Classify.of(resp.code, text)
                         lastKind = kind; lastStatus = resp.code; lastBody = text
-                        Gateway.pool.onError(auth.uid, kind, resp.code, model, text, retryAfter)
+                        noteError(auth, kind, resp.code, model, text, retryAfter)
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                         LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
                         if (kind in failFastKinds) { mapError(res, kind, lastStatus, lastBody, model, false, realm); return }
@@ -626,7 +630,7 @@ object ChatHandler {
                     // 首帧即失败：还没向客户端写任何字节 → 无痕换号重试（head veto）。
                     if (isErr) {
                         val kind = Classify.frame(effectivePayload)
-                        Gateway.pool.onError(auth.uid, kind, 200, model, effectivePayload)
+                        noteError(auth, kind, 200, model, effectivePayload)
                         LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 首帧 error/内嵌失败 kind=$kind -> 换号重试")
                         return Hop(ok = false, sent = false)
                     }
@@ -690,7 +694,7 @@ object ChatHandler {
                 }
                 // 静默回合观测（上游 issue #44）：与非流式同口径，只记 WARN 不改流。
                 if (allowedTools.isNotEmpty() && !sawToolCall && markupCalls == 0 && finalFinish == "stop") {
-                    LogBus.log("WARN| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop")
+                    LogBus.log("INFO| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop（模型选择直接回答，属正常收尾）")
                 }
                 res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), streamChunk(null, finalFinish))}\n\n")
                 frames++
@@ -712,7 +716,7 @@ object ChatHandler {
         val ef = errFrame
         if (ef != null) {
             val kind = Classify.frame(ef)
-            Gateway.pool.onError(auth.uid, kind, 200, model, ef)
+            noteError(auth, kind, 200, model, ef)
             LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
             return Hop(ok = false, sent = true)
         }
@@ -794,7 +798,7 @@ object ChatHandler {
         if (errFrame != null) {
             val ef = errFrame
             val kind = Classify.frame(ef)
-            Gateway.pool.onError(auth.uid, kind, 200, model, ef)
+            noteError(auth, kind, 200, model, ef)
             LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} nonstream 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
             // 非流式路径拿到的上游 error 帧：这里不是「选号失败」，所以只按 kind 分类
             // （selectionFailed = false 表示不要去做「全池模型级阻塞」判定）。
@@ -836,7 +840,7 @@ object ChatHandler {
         // 可重试错误会让这类正常回合反复重试、每次都真实计费），只留一条可检索的 WARN。
         // 零调用按**集合大小**判（上游每帧都带 "tool_calls":[]，按字段存在判会误判）。
         if (allowedTools.isNotEmpty() && toolCalls.isEmpty() && finish == "stop") {
-            LogBus.log("WARN| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop")
+            LogBus.log("INFO| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop（模型选择直接回答，属正常收尾）")
         }
         val message = buildJsonObject {
             put("role", JsonPrimitive("assistant"))
@@ -944,6 +948,118 @@ object ChatHandler {
         }
         sb.append('}')
         return sb.toString()
+    }
+
+    /**
+     * 错误处置的**统一入口**：只有 401 需要额外一次求证，其余原样交给账号池。
+     *
+     * 为什么 401 要特殊处理：网关边缘拦截（APISIX 的 401 页）与 token 真失效的响应体
+     * 可能完全一样，只有 refresh 的结果能区分。旧实现「一次 401 就 Disable」的实案是
+     * 两个健康号各 3 次 401 被判死、人工 revive 后立刻恢复（上游 issue #66）。
+     *
+     * 三分支：refresh 成功 → 落盘新凭证 + 软冷却（瞬时拦截）；被明确拒绝 → 禁用（真死）；
+     * 无判词（传输错误 / 5xx / 429 / HTML 页）→ 软冷却，**绝不据此禁用**。
+     */
+    private fun noteError(
+        auth: AuthEntry,
+        kind: ErrKind,
+        status: Int,
+        model: String,
+        body: String,
+        retryAfterSec: Long = 0,
+    ) {
+        // 触发条件用「SESSION_DEAD **或** HTTP 401」：Classify 只在 body 命中特定文案时才
+        // 出 SESSION_DEAD，而边缘拦截的 401（APISIX HTML 页、无业务信封）走的是 CLIENT ——
+        // 那正是最需要求证的形态，只按 kind 判会把它漏掉。
+        if (kind != ErrKind.SESSION_DEAD && status != 401) {
+            Gateway.pool.onError(auth.uid, kind, status, model, body, retryAfterSec)
+            return
+        }
+        val proof = proveSession(auth)
+        when (proof.verdict) {
+            SessionVerdict.ALIVE -> {
+                // 必须落盘：只改内存的话，重启会拿旧 RT 去刷新，反而变成真死。
+                proof.renewed?.let { Gateway.store.saveAuth(it) }
+                // 只停 30s（不是 soft_rate 的 600s 起）：access token 在本端是 1h 固定到期、
+                // 且没有其它主动续期点，按 600s 罚会让每个号每小时白停 10 分钟。30s 足够
+                // 压住「同一时刻多个并发请求都带旧 token」的抖动，又几乎不损容量。
+                Gateway.pool.softCooldownForSession(auth.uid, "网关 401 但 refresh 成功（瞬时拦截）", baseSec = 30)
+                LogBus.log("| 401 求证：refresh 成功 → 瞬时拦截，不计 session dead（uid=${auth.uid.take(8)}）")
+            }
+
+            SessionVerdict.DEAD -> {
+                Gateway.pool.markSessionDead(auth.uid)
+                LogBus.log("| 401 求证：refresh 被明确拒绝 → session 真死，禁用（uid=${auth.uid.take(8)}）")
+            }
+
+            SessionVerdict.UNKNOWN -> {
+                Gateway.pool.softCooldownForSession(auth.uid, "网关 401 且 refresh 无判词（软冷却，不计死）")
+                LogBus.log("| 401 求证：refresh 未给出判词 → 软冷却，不计死（uid=${auth.uid.take(8)}）")
+            }
+        }
+    }
+
+    /** [noteError] 的 uid 重载（Responses 路径只持有 uid）。 */
+    private fun noteError(
+        uid: String,
+        kind: ErrKind,
+        status: Int,
+        model: String,
+        body: String,
+        retryAfterSec: Long = 0,
+    ) {
+        val auth = Gateway.store.getAuth(uid)
+        if (auth == null) {
+            // 拿不到凭证就无法求证 —— 此时**不能**退回「未经求证就禁用」的老语义，
+            // 只做软冷却（最坏情况是多轮转一次，代价远小于误杀）。
+            if (kind == ErrKind.SESSION_DEAD || status == 401) {
+                Gateway.pool.softCooldownForSession(uid, "401 但本地无凭证可求证（软冷却）", baseSec = 30)
+            } else {
+                Gateway.pool.onError(uid, kind, status, model, body, retryAfterSec)
+            }
+            return
+        }
+        noteError(auth, kind, status, model, body, retryAfterSec)
+    }
+
+    /**
+     * 同一账号的 401 求证**串行化**，并且总是用**最新**凭证去刷新。
+     *
+     * 为什么必须这样：上游会轮换 refresh_token。并发请求同时对同一 uid 发 401 时，若各自
+     * 拿同一份旧 RT 去刷新，先到的一次会让旧 RT 失效，后到的那次收到 4xx → 被判 DEAD →
+     * 把一个完全健康的号**永久禁用**（正是本轮要消灭的误杀，换了个入口复发）。
+     *
+     * 二次读取最新 token：如果别的线程已经刷新成功（access_token 变了），本次 401 就是
+     * 旧 token 造成的，直接判健康、不再重复打 refresh。
+     */
+    private val sessionLocks = java.util.concurrent.ConcurrentHashMap<String, Any>()
+
+    private fun proveSession(auth: AuthEntry): SessionProof {
+        val lock = sessionLocks.computeIfAbsent(auth.uid) { Any() }
+        return synchronized(lock) {
+            val latest = runCatching { Gateway.store.getAuth(auth.uid) }.getOrNull() ?: auth
+            if (latest.access_token.isNotBlank() && latest.access_token != auth.access_token) {
+                return@synchronized SessionProof(SessionVerdict.ALIVE, null)
+            }
+            runCatching { runBlocking { Gateway.upstream.verifySession(latest) } }
+                .getOrDefault(SessionProof(SessionVerdict.UNKNOWN))
+        }
+    }
+
+    /**
+     * 主动续期：access token 在本端是 **1 小时固定到期**（刷新响应不带 expiresIn 时按 3600
+     * 记），而网关没有别的续期点 —— 不主动刷的话，每次自然过期都会先撞一次 401。
+     *
+     * 只在临期 120s 内动作；刷新失败就按原凭证继续（那条 401 路径会兜住）。
+     */
+    private fun ensureFreshToken(auth: AuthEntry): AuthEntry {
+        if (auth.refresh_token.isBlank() || auth.access_expires_at <= 0) return auth
+        val now = System.currentTimeMillis() / 1000
+        if (auth.access_expires_at - now > 120) return auth
+        val renewed = runCatching { runBlocking { Gateway.upstream.refresh(auth) } }.getOrNull() ?: return auth
+        Gateway.store.saveAuth(renewed)
+        LogBus.log("| token 临期（${auth.access_expires_at - now}s），已主动续期 uid=${auth.uid.take(8)}")
+        return renewed
     }
 
     private fun mapError(
@@ -1542,7 +1658,7 @@ object ChatHandler {
             if (errFrame != null) {
                 val ef = errFrame
                 val kind = Classify.frame(ef)
-                Gateway.pool.onError(uid, kind, 200, model, ef)
+                noteError(uid, kind, 200, model, ef)
                 LogBus.log("| # $realm/$model responses 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
                 // 同上：错误体已回写 → sent=true，避免被 runPipeline 当成「未发数据」而重试。
                 res.sendError(mapCode(kind), ef, "upstream_error")
@@ -1787,7 +1903,7 @@ object ChatHandler {
             if (errFrame != null) {
                 val ef = errFrame
                 val kind = Classify.frame(ef)
-                Gateway.pool.onError(uid, kind, 200, model, ef)
+                noteError(uid, kind, 200, model, ef)
                 LogBus.log("| # $realm/$model responses 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
                 ev("response.failed", buildJsonObject {
                     put("type", JsonPrimitive("response.failed"))

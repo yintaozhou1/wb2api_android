@@ -549,11 +549,35 @@ object Rewrite {
         return 0L
     }
 
+    /**
+     * 客户端是否把思考**显式关掉**（off / none / disabled）。
+     *
+     * 上游静态档位表里没有任何模型声明 `off` 档，`effortRank` 里的 0 只是排序占位。
+     * 不特判的话 off 会被降级管线「就近抬成最弱正档」——客户端要的是关，拿到的是
+     * 「思考开着但最弱」（上游实测：effort=off 返回 157 字 reasoning，与 high 无异）。
+     * 唯一能落地的关闭形态是 `thinking.type=disabled`。
+     */
+    private fun effortValueOff(obj: MutableMap<String, Any?>): Boolean {
+        val raw = (obj["reasoning_effort"] as? String)
+            ?: (obj["reasoningEffort"] as? String)
+            ?: return false
+        return raw.trim().lowercase() in setOf("off", "none", "disabled")
+    }
+
     private fun injectThinking(obj: MutableMap<String, Any?>, defaultEffort: String) {
         val model = obj["model"] as? String ?: return
         if (!isDeepSeekModel(model)) return
         val th = asStringMap(obj["thinking"])
         val typ = (th?.get("type") as? String)?.trim() ?: ""
+        // 显式 off/none **优先于一切 enabled 形态**（客户端要的是「关」）：写官方唯一的
+        // 关闭形态 thinking.type=disabled，并清掉档位字段（disabled + effort 的组合上游
+        // 语义未取证，思考管线的 disabled 分支本来就要求两者不共存）。
+        if (effortValueOff(obj)) {
+            if (th == null) obj["thinking"] = mutableMapOf<String, Any?>("type" to "disabled")
+            else th["type"] = "disabled"
+            obj.remove("reasoning_effort"); obj.remove("reasoningEffort")
+            return
+        }
         if (typ.isEmpty()) {
             // 客户端没声明思考：小额预算下思考必然吃光正文 → 不注入（见上面的实测表）。
             // 16 以下不拦：官方客户端用 max_tokens=1 做 key 探活，那种请求按原样即可。
@@ -588,6 +612,9 @@ object Rewrite {
             else -> return
         }
         val reqStr = (obj[key] as? String)?.trim()?.lowercase() ?: return
+        // off/none/disabled 是「关闭」而不是档位：不参与降级，直接删字段（上游只认自己的
+        // 档位表，把 off 降成 low 等于偷偷打开思考）。关闭形态由 injectThinking 落地。
+        if (reqStr == "off" || reqStr == "none" || reqStr == "disabled") { obj.remove(key); return }
         val reqIdx = effortRank[reqStr] ?: return
         var best = ""; var bestIdx = -1
         for (s in supported) {

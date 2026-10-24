@@ -276,8 +276,7 @@ class AccountPool(
             ),
             credits = if (credit > 0) (s.credits - credit).coerceAtLeast(0.0) else s.credits,
         ))
-        persistThrottled()
-    }
+    }.also { persistThrottled() }
 
     /**
      * 吐字速率（token/s）。分母是**生成耗时** = 端到端耗时 − 首 token 等待（TTFB）。
@@ -360,7 +359,12 @@ class AccountPool(
                 val keep = ns.rate_limited_models.filter { it.model != model }
                 when {
                     resetAt > t -> {
-                        val until = minOf(resetAt, t + cap)
+                        // 模型级冷却**不**受 soft_rate_max 封顶：它只停 (账号, 模型) 这一个
+                        // 组合，同号切其他模型照常可用，按上游墙钟完整恢复没有「无限期拉黑」
+                        // 的风险。被 2h 封顶截断的后果是「上游说 19:25 恢复、网关 19:14 就
+                        // 开始重试」，冷却期内反复撞 429、污染错误日志（上游 2026-10-24）。
+                        // 账号级仍封顶：防一个号被长期冷却后又层层叠加。
+                        val until = if (modelLevel) resetAt else minOf(resetAt, t + cap)
                         ns = ns.copy(rate_limited_models = keep +
                             ModelLimit(model, "rate_limit", reset_at = resetAt, until = until, reason = why))
                         if (!modelLevel) ns = ns.copy(cool_until = until, cool_kind = "soft_rate")
@@ -368,7 +372,8 @@ class AccountPool(
                     }
                     retryAfterSec > 0 -> {
                         // body 无重置文案，但上游给了 Retry-After 头 → 冷却到该时刻。
-                        val until = minOf(t + retryAfterSec, t + cap)
+                        // 模型级同样不封顶（理由见上面的 resetAt 分支）。
+                        val until = if (modelLevel) t + retryAfterSec else minOf(t + retryAfterSec, t + cap)
                         ns = ns.copy(rate_limited_models = keep +
                             ModelLimit(model, "rate_limit", reset_at = until, until = until, reason = why))
                         if (!modelLevel) ns = ns.copy(cool_until = until, cool_kind = "soft_rate")
@@ -524,8 +529,14 @@ class AccountPool(
             }
         }
         store.putState(ns)
+    }.also {
         // 与成功路径同口径：错误风暴时**不要**每个请求都整份写盘 + fsync（那会拖慢本就
         // 紧张的 HTTP 线程池）。1s 节流 + 调度器 flush 兜底，崩溃最多丢 1s 的计数。
+        //
+        // **必须在 withStateLock 之外**：persistThrottled 拿的是 Pool 监视器，而 flush()
+        // 是「持 Pool 监视器 → 取 Store 监视器」；若在 Store 临界区内取 Pool 锁，就是
+        // 教科书式的 AB-BA 死锁（Store 监视器永不释放 → 之后所有 stateOf/putState/pick
+        // 全部永久阻塞，网关静默假死）。
         persistThrottled()
     }
 
@@ -542,9 +553,8 @@ class AccountPool(
         val t = now()
         val (ns, cool) = degradeNext(s.copy(last_used_at = t), cfg().pool, t)
         store.putState(ns)
-        store.saveState(sticky)
         if (cool > 0) log("degrade/transport", uid, model, cool)
-    }
+    }.also { persistThrottled() }
 
     /** WAF 触发记录（按 realm 分桶，60s 窗口内出现 ≥2 个不同账号即判定该 realm 被 WAF）。 */
     fun noteWaf(uid: String) {
@@ -851,6 +861,58 @@ class AccountPool(
         if (remain <= 0 || remain > capMs) return 0
         return remain + (Math.random() * remain * 0.25).toLong()
     }
+
+    /**
+     * 401 已被 refresh **求证为真死**：禁用（不可自愈，必须重新登录）。
+     *
+     * 与旧实现（收到 SESSION_DEAD 就禁用）的区别：禁用这个决定现在只由「refresh 被应用层
+     * 明确拒绝」触发，边缘拦截 / 网络抖动不再能误杀伤健康账号（上游 issue #66）。
+     */
+    fun markSessionDead(uid: String) = store.withStateLock {
+        val s = store.stateOf(uid)
+        store.putState(
+            // **不动 paused**：那是用户手动「暂停选号」的意图，禁用不该顺手清掉。
+            s.copy(
+                disabled = true, cool_kind = "session_dead",
+                last_used_at = now(), err_total = s.err_total + 1,
+            ),
+        )
+        log("session_dead/verified", uid, "", 0L)
+        // 终态**立即**落盘：禁用状态若丢在节流窗口里（进程被杀），死号会复活继续刷 401。
+        // saveState 与 withStateLock 是同一把 Store 监视器（可重入），不会引入 Pool 锁。
+        store.saveState(sticky)
+    }
+
+    /**
+     * 401 但 refresh **没有给出判词**（或证明账号正常）：只做软冷却，**不计死**。
+     *
+     * 用 soft_rate 家族而不是固定 60s：一个「chat 恒 401 但 refresh 恒成功」的降级 token
+     * 号会被每 60s 轮换一次 RT（一天 1440 次），指数退避能把这类号的请求频率压下来。
+     */
+    fun softCooldownForSession(uid: String, reason: String, baseSec: Long = 0) = store.withStateLock {
+        val s = store.stateOf(uid)
+        val p = cfg()
+        val t = now()
+        val cap = Durations.parse(p.cooldown.soft_rate_max, 7200)
+        val base = if (baseSec > 0) baseSec else Durations.parse(p.cooldown.soft_rate, 600)
+        val streak = s.soft_streak + 1
+        val cool = (base * (1L shl (streak - 1).coerceIn(0, 8))).coerceAtMost(cap)
+        // **只延长、不缩短**：hard_credit（到次日 04:00）/ breaker / account_fault 这类更强的
+        // 冷却不能被一次 401 覆盖成 600s —— 否则账号提前回到轮转、继续撞 402/429。
+        val until = maxOf(s.cool_until, t + cool)
+        val stronger = s.cool_until > t && s.cool_kind !in setOf("", "gateway_401", "soft_rate")
+        store.putState(
+            s.copy(
+                cool_until = until,
+                cool_kind = if (stronger) s.cool_kind else "gateway_401",
+                soft_streak = streak,
+                last_used_at = t,
+                err_total = s.err_total + 1,
+            ),
+        )
+        log("gateway_401(soft)", uid, "", until - t)
+        if (reason.isNotBlank()) LogBus.log("[pool] $reason uid=${uid.take(8)}")
+    }.also { persistThrottled() }
 
     /** 某模型请求成功：清除 11102 负缓存（对齐 Go BlockModelClear）。 */
     fun clearModelBlock(uid: String, model: String) {

@@ -49,7 +49,8 @@ object Up {
     const val DEFAULT_CLIENT_VERSION_CN = "5.8.3"
     const val DEFAULT_CLIENT_VERSION_GLOBAL = "5.8.4"
     /** 官方内置 CLI 版本（两版分发包同一值）。 */
-    const val DEFAULT_CLI_VERSION = "2.161.0"
+    /** 官方 CLI 版本（2026-10-24 起为 2.174.0）：UA 的 `CLI/<v>` 段与登录链接的 version 同源。 */
+    const val DEFAULT_CLI_VERSION = "2.174.0"
 
     /** 按 realm 取生效的客户端版本。 */
     fun clientVersion(realm: String): String =
@@ -124,7 +125,7 @@ object Up {
     const val P_CLAIM_COMPENSATION = "/billing/meter/claim-compensation"
 
     /** 桌面客户端 UA：WorkBuddy 5.8.3 内嵌 CLI 2.161.0。 */
-    const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+    const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.174.0"
     /** Web 端浏览器 UA（desktop.go:267）。 */
     const val UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
     /** 小程序口径头值（tasks.go:35）。 */
@@ -288,6 +289,21 @@ object Up {
  * 消息级 ID（X-Conversation-Message-ID / X-Request-ID / B3 SpanId）每条出站独立生成，
  * 属于传输层细节，不放进这个数据类。
  */
+/** 401 的求证结果（见 [UpstreamClient.verifySession]）。 */
+enum class SessionVerdict {
+    /** refresh 成功：401 是边缘瞬时拦截，账号健康。 */
+    ALIVE,
+
+    /** refresh 被应用层明确拒绝：token 真失效，只能重新登录。 */
+    DEAD,
+
+    /** refresh 未给出判词（传输错误 / 5xx / 429 / HTML 拦截页 / 无 RT）：不下结论。 */
+    UNKNOWN,
+}
+
+/** [UpstreamClient.verifySession] 的返回值：判词 + refresh 成功时的新凭证。 */
+data class SessionProof(val verdict: SessionVerdict, val renewed: AuthEntry? = null)
+
 data class ConvIds(
     val clientConversationId: String = "",
     val sessionKey: String = "",
@@ -372,6 +388,18 @@ class UpstreamClient(
      */
     private val chatHttp: OkHttpClient = http.newBuilder()
         .readTimeout(600, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * 求证 / 续期专用客户端：**必须有 callTimeout**。
+     *
+     * 共享的 [http] 是 `callTimeout(0)` + `readTimeout(120s)`，而 401 求证发生在 HTTP 工作
+     * 线程里（BIO：core 8 / max 32，满即 503）。全池 token 同时过期时，32 个线程可能被
+     * 「connect 10s + read 120s」一起挂住 → 网关整体 503。刷新请求本身很短，6s 足够。
+     */
+    private val verifyHttp: OkHttpClient = http.newBuilder()
+        .callTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
         .build()
 
     // ---------- 请求头 ----------
@@ -743,7 +771,9 @@ class UpstreamClient(
             commonHeaders(this, realm, null)
         }.build()
         runCatching {
-            http.newCall(req).execute().use { resp ->
+            // 短超时：该方法现在也在请求路径上被主动续期调用（见 ChatHandler.ensureFreshToken），
+            // 用 120s 的共享客户端会把一次普通请求拖成两分钟。
+            verifyHttp.newCall(req).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) return@withContext null
                 val data = parseEnvelope(text)
@@ -757,6 +787,79 @@ class UpstreamClient(
                 )
             }
         }.getOrNull()
+    }
+
+    /**
+     * 用 refresh 端点**求证**一次 401（上游 issue #66）。
+     *
+     * 为什么必须求证：网关边缘拦截（APISIX 的 HTML/JSON 401、无业务信封）与 token 真失效
+     * 的响应体可能完全一样，只有 refresh 的结果能区分。旧实现「一次 401 就禁用」的实案是：
+     * 两个号各累计 3 次 401 被判死，人工 revive 后立刻连续 200 —— 好号被永久踢出池子。
+     *
+     * 判词规则（对齐上游 handler 的 gateway 401 分支）：
+     *  - refresh 成功 → ALIVE（并把新凭证带回，调用方**必须落盘**：只改内存的话重启会用
+     *    旧 RT 去刷新，反而变成真死）；
+     *  - refresh 失败且是**应用层明确判词**（4xx、非 429、非 HTML 拦截页、非空体）→ DEAD；
+     *  - 其余（传输错误 / 5xx / 429 / HTML 页 / 空体 / 无 RT）→ UNKNOWN，绝不据此禁用。
+     */
+    suspend fun verifySession(auth: AuthEntry): SessionProof = withContext(Dispatchers.IO) {
+        if (auth.refresh_token.isBlank()) {
+            return@withContext SessionProof(SessionVerdict.UNKNOWN)
+        }
+        val deadHints = listOf("invalid", "expired", "revoked", "失效", "已过期", "登录过期")
+        val deadSubjects = listOf("refresh", "token", "session", "grant", "登录")
+        fun looksDead(t: String): Boolean =
+            deadHints.any { t.contains(it, ignoreCase = true) } &&
+                deadSubjects.any { t.contains(it, ignoreCase = true) }
+        val realm = auth.realm
+        val url = Up.base(realm) + Up.P_AUTH_REFRESH
+        val body = buildJsonObject {
+            put("refresh_token", JsonPrimitive(auth.refresh_token))
+            put("refreshToken", JsonPrimitive(auth.refresh_token))
+        }
+        val req = Request.Builder().url(url)
+            .post(AppJson.encodeToString(JsonObject.serializer(), body).toRequestBody(mediaJson))
+            .apply { commonHeaders(this, realm, null) }
+            .build()
+        try {
+            verifyHttp.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (resp.isSuccessful) {
+                    val data = runCatching { parseEnvelope(text) }.getOrNull()
+                    val access = data?.str("access_token", "accessToken", "token").orEmpty()
+                    if (access.isBlank()) {
+                        // HTTP 200 + 业务错误信封（`{"code":xxx,"msg":"invalid refresh token"}`）
+                        // 是「RT 真失效」最常见的形态之一：只有命中失效文案才判死。
+                        return@use SessionProof(
+                            if (looksDead(text)) SessionVerdict.DEAD else SessionVerdict.UNKNOWN,
+                        )
+                    }
+                    val renewed = auth.copy(
+                        access_token = access,
+                        refresh_token = data?.str("refresh_token", "refreshToken")
+                            ?.ifBlank { auth.refresh_token } ?: auth.refresh_token,
+                        access_expires_at = System.currentTimeMillis() / 1000 + 3600,
+                        updated_at = System.currentTimeMillis() / 1000,
+                    )
+                    return@use SessionProof(SessionVerdict.ALIVE, renewed)
+                }
+                // 限流 / 服务端故障 / 空体 / 边缘 HTML 页：都不构成「token 判死」的证据。
+                if (resp.code == 429 || resp.code >= 500 || text.isBlank() ||
+                    text.contains("<html", ignoreCase = true)
+                ) {
+                    return@use SessionProof(SessionVerdict.UNKNOWN)
+                }
+                // 只有「明确的失效文案」才算死。404（路径变更）/ 400（请求体字段变了）/
+                // 403（WAF 的 JSON 页）都不是 token 失效的证据 —— 判死会一夜间清空整池。
+                SessionProof(if (looksDead(text)) SessionVerdict.DEAD else SessionVerdict.UNKNOWN)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 取消必须原样抛出：吞掉会让停机/超时后仍继续改池状态、写盘。
+            throw e
+        } catch (e: Throwable) {
+            // 传输层失败（连不上 / TLS / 超时）当然不能当成「token 死了」。
+            SessionProof(SessionVerdict.UNKNOWN)
+        }
     }
 
     // ---------- 模型 ----------
@@ -1889,7 +1992,21 @@ object RateLimit {
     private val fmt: java.time.format.DateTimeFormatter =
         java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
 
-    fun isModelRateLimit(body: String): Boolean = reModelRateLimit.containsMatchIn(body)
+    /**
+     * 429 业务码 6000 只在带「切换其他模型」文案时才算**模型级**（上游 2026-10-24）：
+     * 不带该文案的 6000 语义未知，仍按账号级处理 —— 把「单模型限流」误判成账号级会把
+     * 整号冻结 soft_rate_max（2h），其他模型也被殃及。
+     *
+     * 注意**不要**把 14003 加进来：它是 `ErrKind.MODEL_BUSY`（10~60s 独立短冷却），
+     * 而本函数的调用方（[Classify.frame]）会把它判成账号级 SOFT_RATE，直接回退 1.6.6 的修复。
+     */
+    private val reCode6000 = Regex("\"code\"\\s*:\\s*\"?6000\"?")
+    private val reSwitchModelHint =
+        Regex("切换其他模型|切换其他模型继续使用|switch to another model|try another model", RegexOption.IGNORE_CASE)
+
+    fun isModelRateLimit(body: String): Boolean =
+        reModelRateLimit.containsMatchIn(body) ||
+            (reCode6000.containsMatchIn(body) && reSwitchModelHint.containsMatchIn(body))
 
     /** 解析上游重置墙钟（epoch 秒）；无重置文案或解析失败 → 0。 */
     fun parseReset(body: String): Long {
