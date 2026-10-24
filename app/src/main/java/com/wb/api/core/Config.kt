@@ -48,6 +48,13 @@ data class UiCfg(
     val theme: String = "system",
     val haptics: Boolean = true,
     val animations: Boolean = true,
+    /**
+     * 网关地址浮窗：启动网关后在其它应用上层显示 `127.0.0.1:<port>`。
+     *
+     * 默认开。需要 `SYSTEM_ALERT_WINDOW` 权限（系统设置页授予）：没有权限时浮窗静默
+     * 不显示、并在启动时提示一次，**不阻断网关启动**（浮窗是附加展示，网关是主功能）。
+     */
+    val overlay: Boolean = true,
     val monet: Boolean = false,
     val model_columns: Int = 2,
     val model_sort: String = "default",

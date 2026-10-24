@@ -19,6 +19,7 @@ import com.wb.api.pool.PoolCounts
 import com.wb.api.scheduler.Scheduler
 import com.wb.api.server.GrowthService
 import com.wb.api.server.ModelService
+import com.wb.api.overlay.AddressOverlay
 import com.wb.api.service.GatewayService
 import com.wb.api.upstream.DeviceAuth
 import kotlinx.coroutines.Dispatchers
@@ -254,6 +255,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val t0 = android.os.SystemClock.elapsedRealtime()
                 _gatewayBusy.value = "正在启动网关…"
                 GatewayService.start(ctx)
+                // 悬浮窗权限：**不阻断启动**，且**必须在拉起服务之后**再跳授权页 ——
+                // 跳转会立刻把应用推入后台，若先跳再 startForegroundService，
+                // Android 12+ 的后台启动限制可能直接拒绝（用户只看到「启动失败」）。
+                if (Gateway.store.config.ui.overlay && !AddressOverlay.canDraw(ctx)) {
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "请开启「显示在其他应用上层」权限，返回应用后会自动显示网关地址浮窗",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                    AddressOverlay.requestPermission(ctx)
+                }
                 val ok = withContext(Dispatchers.IO) {
                     var i = 0
                     while (i < 60 && !Gateway.isRunning()) { delay(100); i++ }

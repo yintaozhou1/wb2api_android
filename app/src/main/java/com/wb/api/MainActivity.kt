@@ -11,6 +11,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.wb.api.overlay.AddressOverlay
 import com.wb.api.ui.AppRoot
 import com.wb.api.ui.AppViewModel
 import com.wb.api.ui.LocalWbAnimations
@@ -53,6 +54,21 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             withTimeoutOrNull(3_000) { vm.overview.drop(1).first() }
             reportFullyDrawn()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 从系统授权页返回、或网关在别处被启动后回到应用：把浮窗状态对齐到「真实运行态」。
+        runCatching {
+            if (!Gateway.isInitialized()) return
+            // 用 serverRunning() 而不是 isRunning()：停止过程中前者才是「端口是否真的还活着」，
+            // 与 Service 侧 syncOverlay 的判定保持一致，避免两边互相 show/hide 打架。
+            if (!Gateway.store.config.ui.overlay || !Gateway.serverRunning() || !AddressOverlay.canDraw(this)) {
+                AddressOverlay.hide()
+                return
+            }
+            AddressOverlay.show(this, "127.0.0.1:${Gateway.port}")
         }
     }
 }

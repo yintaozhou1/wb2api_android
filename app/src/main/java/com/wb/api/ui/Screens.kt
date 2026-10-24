@@ -1169,6 +1169,37 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                         checked = draft.ui.animations,
                         onCheckedChange = { applyUi(draft.ui.copy(animations = it)) },
                     )
+                    // LocalContext.current 是 @Composable 属性，必须在组合作用域里取一次，
+                    // 不能在 onCheckedChange 的普通 lambda 里调用（会抛
+                    // "CompositionLocal ... not present"）。
+                    val overlayCtx = androidx.compose.ui.platform.LocalContext.current
+                    WbSwitchRow(
+                        title = "网关地址浮窗",
+                        summary = "启动网关后在其它应用上层显示 127.0.0.1:端口（需「显示在其他应用上层」权限）",
+                        checked = draft.ui.overlay,
+                        onCheckedChange = { on ->
+                            applyUi(draft.ui.copy(overlay = on))
+                            if (!on) {
+                                // 浮窗是系统级窗口，不主动摘掉就会一直盖在别的应用上。
+                                com.wb.api.overlay.AddressOverlay.hide()
+                            } else if (com.wb.api.Gateway.serverRunning() &&
+                                com.wb.api.overlay.AddressOverlay.canDraw(overlayCtx)
+                            ) {
+                                com.wb.api.overlay.AddressOverlay.show(
+                                    overlayCtx,
+                                    "127.0.0.1:${com.wb.api.Gateway.port}",
+                                )
+                            }
+                            if (on && !com.wb.api.overlay.AddressOverlay.canDraw(overlayCtx)) {
+                                android.widget.Toast.makeText(
+                                    overlayCtx,
+                                    "请开启「显示在其他应用上层」权限，返回后浮窗会自动出现",
+                                    android.widget.Toast.LENGTH_LONG,
+                                ).show()
+                                com.wb.api.overlay.AddressOverlay.requestPermission(overlayCtx)
+                            }
+                        },
+                    )
                 }
             }
 

@@ -16,6 +16,7 @@ import com.wb.api.Gateway
 import com.wb.api.MainActivity
 import com.wb.api.R
 import com.wb.api.core.LogBus
+import com.wb.api.overlay.AddressOverlay
 import com.wb.api.scheduler.Scheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +39,8 @@ class GatewayService : Service() {
         if (intent?.action == ACTION_STOP) {
             Scheduler.stop()
             Gateway.stopServer()
+            // 先摘浮窗：停止过程中地址已经不可用了，留着只会显示一个连不上的端口。
+            AddressOverlay.hide()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -65,6 +68,9 @@ class GatewayService : Service() {
         }
         Scheduler.start(scope)
         LogBus.log("service started on port ${Gateway.port}")
+        // 浮窗在**端口真正绑定成功之后**才显示：显示出来的地址一定是可用的
+        // （启动失败的分支已经 return，不会走到这里）。
+        syncOverlay()
         return START_STICKY
     }
 
@@ -94,6 +100,7 @@ class GatewayService : Service() {
         )
         runCatching { Scheduler.stop() }
         runCatching { Gateway.stopServer() }
+        runCatching { AddressOverlay.hide() }
         sealArchive()
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         notifyTimedOut()
@@ -123,11 +130,23 @@ class GatewayService : Service() {
     override fun onDestroy() {
         Scheduler.stop()
         Gateway.stopServer()
+        runCatching { AddressOverlay.hide() }
         sealArchive()
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         scope.cancel()
         LogBus.log("service stopped")
         super.onDestroy()
+    }
+
+    /** 按配置与权限同步地址浮窗（关闭开关 → 移除）。 */
+    private fun syncOverlay() {
+        runCatching {
+            if (!Gateway.isInitialized() || !Gateway.store.config.ui.overlay) {
+                AddressOverlay.hide()
+                return
+            }
+            AddressOverlay.show(this, "127.0.0.1:${Gateway.port}")
+        }.onFailure { e -> LogBus.log("[overlay] 同步浮窗失败：${e.message}") }
     }
 
     /**

@@ -6,6 +6,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 网关地址浮窗（启动网关后在其它应用上层显示 127.0.0.1:端口）。
+         权限本身在系统设置页授予（Settings.ACTION_MANAGE_OVERLAY_PERMISSION），
+         未授予时浮窗静默不显示，不影响网关主功能。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!--
