@@ -45,6 +45,14 @@ import kotlin.math.roundToInt
  *  - **不做投影**：overlay 窗口没有背景采样，`setShadowLayer` 又必须开软件层，
  *    而投影会被窗口自身边界裁掉（只剩四个角）——花了软渲染的代价却拿不到效果。
  *
+ * 位置：**水平方向最多拖出 2/3**（屏幕内始终留 1/3 可见，否则会变成「拖出去就再也抓不回来」），
+ * 垂直方向保持整颗在屏内（上下贴边就够了，不需要半出屏）。
+ *
+ * 主题：玻璃取值由 [GlassPill.applyTheme] 统一重算，两条触发路径 ——
+ *  - 应用内主题切换（`ui.theme`）：[refreshTheme] 由 MainActivity 的 LaunchedEffect 调；
+ *  - 系统深浅色切换（`ui.theme = system`）：`Application.registerComponentCallbacks`。
+ * 两条都必须触发重算：旧实现把颜色算在 init 里，切主题后浮窗要「关了再开」才变。
+ *
  * 线程：WindowManager 与 View 动画都要求主线程，[show] / [hide] 内部统一 post 到主线程，
  * 调用方（Service / Activity / ViewModel）不必关心自己跑在哪个线程。
  *
@@ -90,7 +98,35 @@ object AddressOverlay {
         }.onFailure { e -> LogBus.log("[overlay] 无法打开悬浮窗授权页：${e.message}") }
     }
 
+    /**
+     * 水平夹取：允许最多拖出 **2/3**（屏幕内保留 1/3）。
+     *
+     * 为什么不是「完全不许出屏」：贴边时指尖会压着屏幕边缘，想再往里拖很容易变成系统
+     * 返回/手势操作；留一点出屏反而更好拖。但必须留 1/3 可见 —— 全出屏就等于把浮窗弄丢了。
+     * `coerceIn` 在 w >= 屏宽时 (lo > hi) 会抛，故先夹一次上界。
+     */
+    private fun clampX(x: Int, w: Int, screenW: Int): Int {
+        val lo = -(w * 2) / 3
+        val hi = (screenW - w / 3).coerceAtLeast(lo)
+        return x.coerceIn(lo, hi)
+    }
+
+    /** 垂直夹取：整颗在屏内（上下不做半出屏）。 */
+    private fun clampY(y: Int, h: Int, screenH: Int): Int =
+        y.coerceIn(0, (screenH - h).coerceAtLeast(0))
+
     fun isShowing(): Boolean = view?.isAttachedToWindow == true
+
+    /**
+     * 按当前主题重算玻璃取值（应用内主题切换后由 MainActivity 调用）。
+     *
+     * 走主线程：`View.invalidate()` 本身线程安全，但这里还要读配置，和其他浮窗操作统一
+     * 在主线程排队，避免与 show/hide 交错。
+     */
+    fun refreshTheme() {
+        if (Looper.myLooper() == Looper.getMainLooper()) view?.applyTheme()
+        else main.post { view?.applyTheme() }
+    }
 
     /** 显示浮窗；已显示时只更新文字（换端口不必重建窗口）。 */
     fun show(ctx: Context, address: String) {
@@ -129,6 +165,11 @@ object AddressOverlay {
         val wm = app.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val pill = GlassPill(app, address)
+        // 系统深浅色变化时重算取值（应用内主题切换走 refreshTheme，两条路径互补）。
+        // 先注销再注册：`registerComponentCallbacks` 对同一实例重复注册会重复回调，
+        // 而「显示→被系统移窗→再显示」这条路径会走到这里第二次（幂等写法省心）。
+        runCatching { app.unregisterComponentCallbacks(configCallbacks) }
+        runCatching { app.registerComponentCallbacks(configCallbacks) }
         val metrics = app.resources.displayMetrics
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -151,19 +192,9 @@ object AddressOverlay {
         view = pill
         params = lp
         windowManager = wm
-        // 实测尺寸之后再把位置夹回视口：持久化的坐标可能来自别的分辨率/横屏，
-        // 直接用会让胶囊「存在但整颗在屏幕外」（点不到也拖不回来）。
-        pill.post {
-            val maxX = (metrics.widthPixels - pill.width).coerceAtLeast(0)
-            val maxY = (metrics.heightPixels - pill.height).coerceAtLeast(0)
-            val nx = lp.x.coerceIn(0, maxX)
-            val ny = lp.y.coerceIn(0, maxY)
-            if (nx != lp.x || ny != lp.y) {
-                lp.x = nx
-                lp.y = ny
-                runCatching { wm.updateViewLayout(pill, lp) }
-            }
-        }
+        // 实测尺寸之后再把位置夹回边界：持久化的坐标可能来自别的分辨率/横屏，直接用会
+        // 让胶囊「存在但整颗在屏幕外」（点不到也拖不回来）。
+        pill.post { clampToBounds() }
         pill.playEnter()
         LogBus.log("[overlay] 地址浮窗已显示：$address")
     }
@@ -175,6 +206,7 @@ object AddressOverlay {
         view = null
         params = null
         windowManager = null
+        runCatching { v.context.applicationContext.unregisterComponentCallbacks(configCallbacks) }
         v.animate().cancel()
         v.animate()
             .alpha(0f)
@@ -183,6 +215,34 @@ object AddressOverlay {
             .setDuration(140)
             .withEndAction { runCatching { wm?.removeView(v) } }
             .start()
+    }
+
+    /** 按当前实测尺寸把已有位置夹回边界（显示后 / 配置变化后调用）。 */
+    private fun clampToBounds() {
+        val v = view ?: return
+        val lp = params ?: return
+        val wm = windowManager ?: return
+        val m = v.resources.displayMetrics
+        val nx = clampX(lp.x, v.width, m.widthPixels)
+        val ny = clampY(lp.y, v.height, m.heightPixels)
+        if (nx != lp.x || ny != lp.y) {
+            lp.x = nx
+            lp.y = ny
+            runCatching { wm.updateViewLayout(v, lp) }
+        }
+    }
+
+    /**
+     * 系统配置变化（最典型是深浅色切换、横竖屏、字号）：
+     * 主题重算 + 位置按新屏幕尺寸重新夹取。
+     */
+    private val configCallbacks = object : android.content.ComponentCallbacks {
+        override fun onConfigurationChanged(newConfig: Configuration) {
+            view?.applyTheme()
+            clampToBounds()
+        }
+
+        override fun onLowMemory() {}
     }
 
     private fun attachTouch(
@@ -216,11 +276,9 @@ object AddressOverlay {
                     // 超过 6dp 才算拖动：手指抖动不该把「点击」变成「位移」。
                     if (!dragging && (abs(dx) > slop || abs(dy) > slop)) dragging = true
                     if (dragging) {
-                        val metrics = v.resources.displayMetrics
-                        val maxX = (metrics.widthPixels - v.width).coerceAtLeast(0)
-                        val maxY = (metrics.heightPixels - v.height).coerceAtLeast(0)
-                        lp.x = (startX + dx.roundToInt()).coerceIn(0, maxX)
-                        lp.y = (startY + dy.roundToInt()).coerceIn(0, maxY)
+                        val m = v.resources.displayMetrics
+                        lp.x = clampX(startX + dx.roundToInt(), v.width, m.widthPixels)
+                        lp.y = clampY(startY + dy.roundToInt(), v.height, m.heightPixels)
                         runCatching { wm.updateViewLayout(v, lp) }
                     }
                     true
@@ -278,13 +336,26 @@ object AddressOverlay {
         private val dotR = 3.5f * density
         private val gap = 7f * density
 
-        private val bgTop: Int
-        private val bgBottom: Int
+        // 玻璃底色由 applyTheme() 按当前主题重算，故必须是 var（构造时只算一次 = 旧 bug）。
+        private var bgTop: Int = 0
+        private var bgBottom: Int = 0
 
         private var text = address
 
         init {
-            if (resolveDark(ctx)) {
+            contentDescription = "网关地址 $address"
+            applyTheme()
+        }
+
+        /**
+         * 按**当前**主题重算玻璃取值（可重复调用）。
+         *
+         * 必须独立成方法而不是写在 init 里：颜色原本只在构造时算一次，于是「切换主题后
+         * 浮窗不跟着变、必须关了再开」—— 因为浮窗是长生命周期对象，构造时机与主题变更
+         * 时机无关。重算后 invalidate 即可，无需重建窗口。
+         */
+        fun applyTheme() {
+            if (resolveDark(context)) {
                 bgTop = 0x9E1A1A1C.toInt()
                 bgBottom = 0xB31A1A1C.toInt()
                 edgePaint.color = 0x33FFFFFF
@@ -300,7 +371,7 @@ object AddressOverlay {
                 textPaint.color = 0xE61C1C1E.toInt()
                 dotPaint.color = 0xFF2FB457.toInt()
             }
-            contentDescription = "网关地址 $address"
+            invalidate()
         }
 
         fun setAddress(address: String) {

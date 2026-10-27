@@ -8,6 +8,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
@@ -35,6 +36,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             // 主题/取色/触感/动画都从配置读，改设置后立即生效（Reactive，无需重启）。
             val cfg by vm.config.collectAsStateWithLifecycle()
+            // 应用内主题切换（浅色/深色/跟随系统）时，浮窗要**实时**跟着变：
+            // 浮窗是长生命周期对象，主题变更本身不会重建它（1.6.7 的表现是「必须关了再开」）。
+            LaunchedEffect(cfg.ui.theme) { AddressOverlay.refreshTheme() }
             CompositionLocalProvider(
                 LocalWbHaptics provides cfg.ui.haptics,
                 LocalWbAnimations provides cfg.ui.animations,
@@ -68,7 +72,7 @@ class MainActivity : ComponentActivity() {
                 AddressOverlay.hide()
                 return
             }
-            AddressOverlay.show(this, "127.0.0.1:${Gateway.port}")
+            AddressOverlay.show(this, "127.0.0.1:${Gateway.displayPort()}")
         }
     }
 }
