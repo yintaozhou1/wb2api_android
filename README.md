@@ -11,6 +11,102 @@
 - 上游：**OkHttp** 直连官方桌面端 endpoint（CN 主域 `www.workbuddy.cn`，`codebuddy.cn` / `copilot.tencent.com` 兜底），Kotlin 重写请求改写与错误分类
 - 并发：**Kotlin 协程**；后台：**前台 Service**（`dataSync`）常驻
 
+## 变更（1.6.9 / versionCode 48）— 悬浮窗真正可拖出屏、常驻服务不再被 6 小时上限杀、全量审计
+
+### 1. 悬浮窗：这次是真的能拖出屏幕（修 1.6.8 的错）
+
+1.6.8 把夹取逻辑改成「水平最多拖出 2/3」，但**实测拖不出去** —— 因为限制不在我们的
+`clampX`，而在**系统窗口层**：`WindowManager` 会把 `x/y` 夹回显示区域内，除非窗口带
+`FLAG_LAYOUT_NO_LIMITS`（官方文档原话：*allow window to extend outside of the screen*）。
+
+本版补上这个 flag，并且同步修正了两处必须配套的地方：
+
+| 项 | 1.6.8 | 1.6.9 |
+|---|---|---|
+| 窗口标志 | `NOT_FOCUSABLE \| NOT_TOUCH_MODAL` | 追加 **`FLAG_LAYOUT_NO_LIMITS`**（出屏的唯一开关） |
+| 屏幕尺寸基准 | `resources.displayMetrics`（**应用可用区域**，已扣系统栏） | `WindowManager.currentWindowMetrics.bounds`（**整屏**）—— 加了 NO_LIMITS 后坐标系原点在屏幕左上角、不受系统栏约束，两者混用会少算一条导航栏 |
+| 边界 | `x ∈ [-(2/3)w, W − w/3]`、`y ∈ [0, H−h]` | 不变（这次才真正生效） |
+
+结果：向左/右拖可让浮窗**三分之二移出屏幕**，屏幕内始终留三分之一可见（够抓住拖回来）；
+垂直方向仍整颗在屏内。夹取结果会**写回** SharedPreferences，换分辨率/横屏后不会每次启动都重新夹。
+
+### 2. 底层与平台优化（联网核实后逐条评估）
+
+**⚠️ 最重要的一项：常驻服务不再被 6 小时上限杀死**
+
+官方「Foreground service timeouts」（Android 15+ / targetSdk 35+）：`dataSync` 与
+`mediaProcessing` 类型的前台服务在 24 小时内**累计只能跑 6 小时**，到点系统回调
+`Service.onTimeout(int,int)`，几秒内不 `stopSelf()` 就抛 `RemoteServiceException`。
+本项目 targetSdk 37、服务类型一直是 `dataSync` —— 意味着**网关每天跑满 6 小时必被系统停掉**
+（1.6.8 及以前只能在 `onTimeout` 里优雅停机，属于「知道会死，死得体面」）。
+
+本版改用 **`specialUse`**（API 34+ 引入，不受该配额约束）：
+
+| 层 | 实现 |
+|---|---|
+| manifest | `android:foregroundServiceType="dataSync\|specialUse"` + `<property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="local_gateway: …"/>` |
+| 权限 | 新增 `FOREGROUND_SERVICE_SPECIAL_USE`（与原有 `FOREGROUND_SERVICE_DATA_SYNC` 并存） |
+| 代码 | `SDK ≥ 34 ? FOREGROUND_SERVICE_TYPE_SPECIAL_USE : FOREGROUND_SERVICE_TYPE_DATA_SYNC` |
+
+为什么按版本分支：`specialUse` 是 API 34 才有的类型，API 32/33 不认识；而「6 小时上限」
+只对 targetSdk 35+ 生效，API 32/33 用 `dataSync` 本来就不受限。原有 `onTimeout` 处理保留
+（防御旧类型路径，不删）。
+
+**已核实「本来就在享受」的构建优化**（AGP 9.4.1，无需再配）：
+
+| 项 | 状态 |
+|---|---|
+| 优化型资源缩减（`android.r8.optimizedResourceShrinking`） | AGP 9.0 起**默认开启**（`isShrinkResources=true` 即生效），资源与代码联合可达性分析，官方实测小包 50%+ |
+| R8 类重打包（DEX 进一步压缩） | AGP 9.1 起默认 |
+| Kotlin 空检查优化（`-processkotlinnullchecks`） | AGP 9.0 起默认 |
+| R8 full mode + 只接受 `proguard-android-optimize.txt` | 默认；本项目已在用 optimize 规则 |
+| 16 KB 页对齐（Android 15+ 要求） | 无 native 库，`zipalign -P 16` 已通过 |
+| Application.onCreate 极简 / `reportFullyDrawn` / `onTrimMemory` / `<profileable>` | 早已落地 |
+
+**评估后明确不做**（附理由，避免下轮重复研究）：
+
+- **Startup Profile（DEX 布局优化，官方称比只有 Baseline Profile 再快 15%~30%）**：
+  必须用 Jetpack Macrobenchmark 在**真机**上跑启动轨迹生成 `startup-prof.txt`；沙箱无设备，
+  手写规则无法验证有效性，还可能覆盖依赖 AAR 合并出来的 profile。收益不可证 → 不做。
+- **迁移到 AGP 9.3 的新 `optimization { }` DSL**：行为与现状等效（优化资源缩减都启用），
+  但 keep 规则要搬到 `src/<variant>/keepRules/*.keep`，漏一条就可能被 R8 剪错 → 风险 > 收益。
+- **`16KB` / `profileinstaller` / `coreLibraryDesugaring`**：minSdk 32 或纯 Kotlin 工程，无适用面。
+- **收紧 proguard keep（model / miuix theme 全字段保留）**：能进一步瘦身，但序列化与 Miuix
+  内部反射都依赖字段名，误剪是运行期崩溃 → 不做。
+
+### 3. 全量审计修复（逐文件核验）
+
+| 等级 | 位置 | 问题 | 处置 |
+|---|---|---|---|
+| **P0** | `Gateway.startServer` + `HttpServer.start` | 服务已在跑时 `start()` 静默早退，但调用方**仍然**把 `boundPort` 改成配置端口 → 改端口未重启再点启动，浮窗/通知/面板公布一个没人监听的地址（1.6.8 新功能的残留缺口） | `start()` 返回「本次是否真新绑」，只有 true 才刷新 `boundPort` |
+| **P0** | `Pool.noteWaf` | 注释与实现不符：桶里只存时间戳，「60s 内 ≥2 个**不同账号**」实际退化成「≥2 **次**」→ 单账号池里一个号重试两次就把整个 realm 停 60 秒 | 桶内存 `(时间, uid)`，按 distinct uid 判定 |
+| P1 | `ChatHandler` 首帧失败 | 首帧即 error / 空流的两条路径只 `noteError`、**没有回填** `lastKind/lastBody` → 轮转耗尽后一律报「号都挂了」，把 6004 配额 / 11128 渠道校验说成账号故障 | `Hop` 增加 `errKind/errStatus/errBody`，`runPipeline` 据此回填 |
+| P1 | `Pool.clearModelBlock` | 成功路径的裸读-改-写与并发 `onError` 抢同一份 `rate_limited_models` 台账，会互相抹掉 | 纳入 `withStateLock`，落盘留在锁外（与 onError 同规范） |
+| P1 | `Store.loadAuths` | `clear()` 后回填：与 HTTP 线程的 `saveAuth`（token 刷新）交错时会丢新凭证 → 内存退回旧 token、下次 401 白跑求证 | 改为「临时 map → 覆盖合并 → 只淘汰磁盘已删的 uid」 |
+| P1 | `Scheduler` 幂等键清理 | 键是 `name-日期-小时`，清理却用 `endsWith(日期)`（恒 false）→ 触发阈值时把**当天全部**标记删掉，同一小时任务会重复跑 | 改 `contains("-日期-")` |
+| P1 | `HttpServer.start` | bind 失败时 `ServerSocket` 没人关（端口占用时用户连点几次启动 = 漏几个 fd） | 失败即 `close()` 再抛 |
+| P1 | `ChatHandler`（Responses 非流式） | 截断判据与 chat 漂移（漏了「无 `[DONE]`」）→ 断流时半截 tool arguments 会原样下发，客户端 JSON 解析失败、会话卡死 | 统一为 `finish=="length" \|\| !sawDone` |
+| P2 | `Durations.parse` | `"500ms"` 被截成 0 秒 = **无冷却**（配置静默失效） | 用 Double 累加 + 亚秒向上取整到 1s |
+| P2 | `HttpServer.parseQuery` | 畸形转义（`?a=%`）抛异常 → 直接掐断连接、不回 400 | 逐项 `runCatching`，坏参数按原文保留 |
+| P2 | `CrashHandler` | `crash.log` 只追加不裁剪，反复崩溃可写满存储 | 超过 256KB 以本次栈重置 |
+| P2 | `Pool.setDisabled(false)` | 解禁不清 `cool_kind` 残留（session_dead/account_banned） | 已过期冷却的类型一并清空 |
+| P2 | `Pool.acquire` | 返回值 `incrementAndGet() > 0` 恒 true，是假判据 | 改为 Unit（唯一调用点本就忽略返回值） |
+| P2 | `AddressOverlay` | addView 失败时刚注册的 ComponentCallbacks 未注销；夹取后的坐标没写回 | 补注销 + 写回 |
+| P2 | `Upstream` / `ChatHandler` 注释 | 「内嵌 CLI 2.161.0」与实际 2.176.0 不符；`Hop` 的 KDoc 被 `bodyStreamOf` 挤走 | 一并修正 |
+| P2 | `GatewayService` | Android 17 上若从通知/STICKY 等非 UI 入口启动，拿不到「本地网络」权限且**无任何提示** | 启动后检测并写一条可诊断日志 |
+
+**明确不修（评估后认为风险 > 收益，已记录在案）**：
+
+- `/v1/responses` 流式在首帧前就发响应头（chat 路径是「首帧前不发头、可无痕换号」）：
+  要修必须重排 SSE 事件序列（`response.created` 必须先发），在无法真机回归的前提下改动
+  风险过高 —— 保持现状并在此登记为已知差异。
+- 轮转之间的 `Thread.sleep` 占着 HTTP 工作线程：属架构选择（改造成本高、可能引入新并发问题）。
+- 收紧 R8 keep / 手写 Startup Profile：见上一节。
+
+### 4. 其它
+
+- 版本：`1.6.9 / versionCode 48`（覆盖安装，签名不变）
+
 ## 变更（1.6.8 / versionCode 47）— 悬浮窗可拖出屏 + 主题实时跟随、上游 10-27 跟进、审计修复
 
 ### 1. 悬浮窗：拖动边界与主题跟随
