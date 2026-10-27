@@ -49,12 +49,18 @@ class GatewayService : Service() {
         // 显式声明前台服务类型（Android 14+ 起「类型」是硬要求：只声明在清单里也能跑，
         // 但显式传入可避免系统在类型缺失/不匹配时抛 MissingForegroundServiceTypeException，
         // 也比依赖「清单推定」更清楚）。ServiceCompat 内部做了版本分支处理。
-        ServiceCompat.startForeground(
-            this,
-            NOTIF_ID,
-            buildNotification(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-        )
+        // 类型按版本二选一（见 manifest 注释）：
+        //  · API 34+：specialUse —— 不受 dataSync「24h 内累计 6 小时」上限约束，
+        //    否则 targetSdk 35+ 的设备每天跑满 6 小时就会被系统强制 stopSelf
+        //    （官方「Foreground service timeouts」：到点回调 onTimeout，不停止会抛
+        //    RemoteServiceException）。网关是**常驻**能力，必须避开这个配额。
+        //  · API 32–33：没有 specialUse 类型，只能 dataSync（这两个版本本身也没有 6h 限制）。
+        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        }
+        ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), fgsType)
 
         // 启动结果**必须显式判定**：端口被占用等失败若被吞掉，会出现「通知显示运行中、
         // 但 UI 显示未启动」的分裂状态（用户只能反复点按钮）。失败即结束服务并上报原因。
@@ -67,7 +73,17 @@ class GatewayService : Service() {
             return START_NOT_STICKY
         }
         Scheduler.start(scope)
-        LogBus.log("service started on port ${Gateway.port}")
+        // Android 17 起「访问局域网」是运行时权限（NEARBY_DEVICES 组）。UI 里的「启动网关」
+        // 会先申请；但从通知栏 / START_STICKY 重投等入口启动时没有 Activity 可弹框，
+        // 此时监听照常成功、本机回环可用，只是**局域网客户端会被系统拒绝** ——
+        // 不写这一条，用户只会看到「PC 连不上」而查不出原因。
+        if (Build.VERSION.SDK_INT >= 37 &&
+            checkSelfPermission("android.permission.ACCESS_LOCAL_NETWORK") !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            LogBus.log("[sys] 未授予「本地网络」权限：本机 127.0.0.1 可用，局域网设备无法连接（回 App 点一次「启动网关」即可申请）")
+        }
+        LogBus.log("service started on port ${Gateway.displayPort()}")
         // 浮窗在**端口真正绑定成功之后**才显示：显示出来的地址一定是可用的
         // （启动失败的分支已经 return，不会走到这里）。
         syncOverlay()

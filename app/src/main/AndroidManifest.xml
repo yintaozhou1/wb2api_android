@@ -4,7 +4,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 前台服务类型权限（两个都要声明，运行时按系统版本二选一，见 GatewayService）：
+         · DATA_SYNC：API 32–33 唯一可用的「长时任务」类型（API 34 起才有 specialUse）；
+         · SPECIAL_USE：API 34+ 用，**不受 dataSync 的 24h/6h 上限约束**。
+         Android 15 起（targetSdk 35+）dataSync 前台服务在 24 小时内累计只能跑 6 小时，
+         到点系统回调 onTimeout 并要求几秒内 stopSelf —— 那会让「常驻网关」每天固定断线。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 网关地址浮窗（启动网关后在其它应用上层显示 127.0.0.1:端口）。
          权限本身在系统设置页授予（Settings.ACTION_MANAGE_OVERLAY_PERMISSION），
@@ -96,11 +102,19 @@
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.Wb2api" />
 
+        <!-- foregroundServiceType 同时声明两种：API 32/33 不认识 specialUse（34 才引入），
+             运行时按版本选 dataSync；API 34+ 选 specialUse —— 它没有 dataSync 的 6 小时
+             累计上限，这才符合「网关常驻」这一产品形态。 -->
         <service
             android:name=".service.GatewayService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|specialUse">
+            <!-- specialUse 必须给出用途说明（系统与商店都会读它）。 -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local_gateway: 本机常驻的 OpenAI 兼容 API 网关，为已登录账号提供模型转发与流式响应，需要持续监听本机端口" />
+        </service>
 
     </application>
 
