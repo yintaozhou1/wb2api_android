@@ -132,7 +132,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return Overview(
             counts = Gateway.pool.counts(),
             views = views,
-            port = Gateway.port,
+            port = Gateway.displayPort(),
             apiKey = Gateway.store.config.api_key,
             running = Gateway.running.value,
             uptime = Gateway.uptimeSec(),
@@ -742,9 +742,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 保存并应用网关配置（会重建上游客户端）。 */
     fun saveConfig(cfg: GatewayConfig) {
         viewModelScope.launch(Dispatchers.IO) {
-            Gateway.applyConfig(cfg)
+            val listenChanged = Gateway.applyConfig(cfg)
             _config.value = cfg
-            toast("配置已保存并生效")
+            // 端口不能热生效（bind 只在启动时做一次）：文案必须说清楚，不能让用户以为
+            // 已经在听新端口了 —— 那会变成「连不上又找不到原因」。
+            toast(if (listenChanged) "配置已保存，端口将在重启网关后生效" else "配置已保存并生效")
         }
     }
 

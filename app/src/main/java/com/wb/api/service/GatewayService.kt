@@ -145,7 +145,7 @@ class GatewayService : Service() {
                 AddressOverlay.hide()
                 return
             }
-            AddressOverlay.show(this, "127.0.0.1:${Gateway.port}")
+            AddressOverlay.show(this, "127.0.0.1:${Gateway.displayPort()}")
         }.onFailure { e -> LogBus.log("[overlay] 同步浮窗失败：${e.message}") }
     }
 
@@ -186,7 +186,7 @@ class GatewayService : Service() {
         val count = Gateway.pool.counts()
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("wb2api 网关运行中")
-            .setContentText("端口 ${Gateway.port} · 账号 ${count.healthy}/${count.total} 可用 · 点击查看")
+            .setContentText("端口 ${Gateway.displayPort()} · 账号 ${count.healthy}/${count.total} 可用 · 点击查看")
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
             .setContentIntent(open)

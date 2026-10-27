@@ -190,9 +190,56 @@ class Store(private val context: Context) {
 
     // ---------------- 用量 ----------------
 
+    /**
+     * 用量归档上限（8 MB ≈ 4 万条）。
+     *
+     * 为什么必须有：`appendUsage` 每成功一次请求追加一行，而 `readUsage` 是
+     * `readLines()` 全量反序列化 —— 只追加不裁剪的话，常驻跑几个月就是确定性的
+     * OOM / ANR（`requests.jsonl` 早就做了同样的事，这个文件当时漏了）。
+     * 8 MB 足够覆盖面板展示与导出所需的量级，超限按 80% 保留（最旧优先丢弃）。
+     */
+    private val usageMaxBytes = 8L * 1024 * 1024
+
     @Synchronized
     fun appendUsage(rec: UsageRecord) {
-        runCatching { usageFile.appendText(AppJson.encodeToString(UsageRecord.serializer(), rec) + "\n") }
+        runCatching {
+            usageFile.appendText(AppJson.encodeToString(UsageRecord.serializer(), rec) + "\n")
+            // 每次追加后做一次 length()（stat，O(1)）：超限才走裁剪，正常路径零额外 IO。
+            if (usageFile.length() > usageMaxBytes) trimUsageLocked()
+        }
+    }
+
+    /** 与 [trimIfOversizeLocked] 同一套「字节级定位 + 流式拷贝」，不把文件读进内存。 */
+    private fun trimUsageLocked() {
+        val keepTarget = (usageMaxBytes * 8 / 10).coerceAtLeast(256 * 1024)
+        val keepFrom = (usageFile.length() - keepTarget).coerceAtLeast(0)
+        val tmp = File(usageFile.parentFile, usageFile.name + ".tmp.trim")
+        runCatching {
+            java.io.RandomAccessFile(usageFile, "r").use { raf ->
+                raf.seek(keepFrom)
+                // 跳过被截断的半行（字节级找换行，不解码，中文不会损坏）
+                if (keepFrom > 0) {
+                    var b = raf.read()
+                    while (b != -1 && b != '\n'.code) b = raf.read()
+                }
+                java.io.FileOutputStream(tmp).use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = raf.read(buf)
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                    }
+                    out.flush()
+                }
+            }
+            if (!tmp.renameTo(usageFile)) {
+                tmp.copyTo(usageFile, overwrite = true)
+                tmp.delete()
+            }
+        }.onFailure { e ->
+            runCatching { tmp.delete() }
+            LogBus.log("[sys] usage 归档裁剪失败：${e.message}")
+        }
     }
 
     fun readUsage(): List<UsageRecord> {

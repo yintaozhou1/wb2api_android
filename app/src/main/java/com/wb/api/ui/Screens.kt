@@ -1187,7 +1187,7 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                             ) {
                                 com.wb.api.overlay.AddressOverlay.show(
                                     overlayCtx,
-                                    "127.0.0.1:${com.wb.api.Gateway.port}",
+                                    "127.0.0.1:${com.wb.api.Gateway.displayPort()}",
                                 )
                             }
                             if (on && !com.wb.api.overlay.AddressOverlay.canDraw(overlayCtx)) {

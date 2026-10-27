@@ -76,6 +76,20 @@ object Gateway {
 
     fun isInitialized() = initialized
 
+    /**
+     * **实际**绑定的端口（0 = 当前没有监听）。
+     *
+     * 与 [port]（配置值）分开的理由：改监听端口不会重新 bind（正在跑的 SSE 不能被打断），
+     * 于是「配置端口」与「真正在听的端口」会不一致。浮窗 / 常驻通知 / 面板 / 状态必须读
+     * 这一个 —— 否则用户会拿到一个**没人在听**的地址，连不上还查不出原因。
+     */
+    @Volatile
+    var boundPort: Int = 0
+        private set
+
+    /** 展示用端口：有监听就用实际端口，否则退回配置端口（UI 上「将要使用」的地址）。 */
+    fun displayPort(): Int = if (boundPort > 0) boundPort else port
+
     private fun parsePort(listen: String): Int {
         val p = listen.substringAfterLast(':').toIntOrNull()
         return if (p != null && p in 1..65535) p else 7863
@@ -84,14 +98,29 @@ object Gateway {
     fun buildUpstream(cfg: GatewayConfig): UpstreamClient =
         UpstreamClient(cfg.upstream.user_agent, cfg.upstream.timeout_seconds.toLong(), cfg.upstream.low_latency)
 
-    fun applyConfig(cfg: GatewayConfig) {
+    /**
+     * 应用新配置。
+     *
+     * @return 监听端口是否发生变化 —— 调用方据此提示「需要重启网关」（端口不能热生效，
+     *   ServerSocket 只在 startServer 里 bind 一次）。返回布尔而不是让调用方自己去比
+     *   `store.config.listen`：config 在这一行之后已经是新值，比较必须发生在保存**之前**。
+     */
+    fun applyConfig(cfg: GatewayConfig): Boolean {
         val before = store.config
+        val listenChanged = before.listen != cfg.listen
         store.saveConfig(cfg)
         port = parsePort(cfg.listen)
         // 只在真正影响出站行为的字段变化时重建客户端：否则每次保存配置都会换掉 OkHttp 实例，
         // 打断连接池复用（直接推高首字延迟），与「减少首字延迟」的目标相悖。
         if (before.upstream != cfg.upstream) upstream = buildUpstream(cfg)
+        // 监听端口**不会**热生效（ServerSocket 只在 startServer 时 bind 一次）。这里显式留痕，
+        // 免得用户在日志里找不到「为什么改了端口还是旧地址」。
+        if (listenChanged) {
+            val now = if (boundPort > 0) "当前仍在 $boundPort 监听，重启网关后生效）" else "下次启动网关生效）"
+            LogBus.log("监听端口变更：${before.listen} → ${cfg.listen}（$now")
+        }
         LogBus.log("config applied")
+        return listenChanged
     }
 
     /**
@@ -212,9 +241,11 @@ object Gateway {
         if (r.isFailure) {
             val why = r.exceptionOrNull()?.message ?: r.exceptionOrNull()?.javaClass?.simpleName ?: "未知错误"
             server = null
+            boundPort = 0
             failStart(if (why.contains("in use", true) || why.contains("EADDRINUSE", true)) "端口 $port 已被占用" else why)
             return
         }
+        boundPort = port
         setRunning(true)
     }
 
@@ -222,6 +253,11 @@ object Gateway {
     fun stopServer() {
         server?.stop()
         server = null
+        boundPort = 0
+        // 停止前把池状态落盘：落盘有 1s 节流窗口，且唯一的周期 flush 由 Scheduler 提供
+        // （它在 stopServer 之前就先停了）—— 不补这一下，刚发生的冷却 / 禁用 / 计数会
+        // 随「正常停止」一起丢掉，重启后立刻又去打上游（注释只承诺「崩溃最多丢 1s」）。
+        runCatching { pool.flush() }
         // 释放上游空闲连接，避免 keep-alive 半死连接残留。
         runCatching { upstream.http.connectionPool.evictAll() }
         setRunning(false)

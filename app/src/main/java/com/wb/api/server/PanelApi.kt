@@ -52,7 +52,7 @@ object PanelApi {
             put("version", JsonPrimitive("1.11.11-panel-android"))
             put("uptime_sec", JsonPrimitive(Gateway.uptimeSec()))
             put("running", JsonPrimitive(Gateway.running.value))
-            put("port", JsonPrimitive(Gateway.port))
+            put("port", JsonPrimitive(Gateway.displayPort()))
             put("auth_required", JsonPrimitive(Gateway.store.config.api_key.isNotBlank()))
             put("redis_mode", JsonPrimitive("noop"))
             put("sticky_sessions", JsonPrimitive(Gateway.pool.stickyCount()))
