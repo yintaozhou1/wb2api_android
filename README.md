@@ -1,36 +1,22 @@
 # wb2api — Android 原生移植版（基于 workbuddy2api-panel）
 
-把上游 Go 网关 `workbuddy2api-panel`（腾讯 CodeBuddy 账号 → OpenAI 兼容反向代理）
-**全部重构**为原生 Android 应用：
+把上游 Go 网关 [`workbuddy2api-panel`](https://github.com/misakano7545/workbuddy2api-panel)
+（腾讯 CodeBuddy 账号 → OpenAI 兼容反向代理）**全部重构**为原生 Android 应用：
 
+- 上游：**[misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)**
+  —— 请求头族、错误码分类、模型目录、冷却/熔断策略均以它为准，本工程逐版本跟进其发版
 - 语言：**Kotlin**（非套壳、非 HTML UI）
 - UI：**Jetpack Compose + Miuix 0.9.4**（`top.yukonga.miuix.kmp`）：`Scaffold` / `SmallTopAppBar` / `NavigationBar`(dock) /
   `Card` / `SmallTitle` / `TabRow` / `Switch` / `TextField` / `SliderPreference` / `SwitchPreference` /
   `OverlayDialog` / `OverlayBottomSheet` / `SnackbarHost` —— 全部为 Miuix 原生组件，含原生转场动画与按压反馈
 - 传输：**内嵌原生 HTTP 服务器**（自研 `ServerSocket` + 线程池，支持 SSE 分块转发）
-- 上游：**OkHttp** 直连官方桌面端 endpoint（CN 主域 `www.workbuddy.cn`，`codebuddy.cn` / `copilot.tencent.com` 兜底），Kotlin 重写请求改写与错误分类
+- 出站：**OkHttp** 直连官方桌面端 endpoint（CN 主域 `www.workbuddy.cn`，`codebuddy.cn` / `copilot.tencent.com` 兜底），Kotlin 重写请求改写与错误分类
 - 并发：**Kotlin 协程**；后台：**前台 Service** 常驻（Android 14+ 用 `specialUse`、12–13 用 `dataSync` —— 规避 Android 15 起 `dataSync` 的「24 小时内累计 6 小时」上限）
 
 ## 更新日志
 
 每个版本的完整变更说明见 [Releases](https://github.com/yintaozhou1/wb2api_android/releases)。
 仓库内不再保留历史更新日志 —— 与 Release 说明重复，且会让 README 随版本线性膨胀。
-
-## 产物信息
-
-| 项 | 值 |
-|---|---|
-| APK | `wb2api.apk`（release，R8） |
-| 应用名 | wb2api |
-| 包名 | `com.wb.api` |
-| 版本 | 1.6.9 (versionCode 48) |
-| minSdkVersion / targetSdkVersion | 32 / 37 |
-| compileSdk | 37 (Android 17, minor 0) |
-| ABI | **仅 arm64-v8a** |
-| 签名 | keystore=`keystore/wb2api.jks`（**不入库**），alias 与口令见本地 `local.properties` |
-| 签名方案 | **仅 v3**（v1=false, v2=false, v3=true） |
-| 构建 | AGP 9.4.1 + Gradle 9.7.1 + Kotlin 2.4.20 + JDK 21 |
-| SHA-256 | `0191c61286d95415ba000a90b75754de22335bfc2e2c290b70a71ee30d67ec7b`（1.6.9 release APK） |
 
 ## 架构（Go → Kotlin）
 
