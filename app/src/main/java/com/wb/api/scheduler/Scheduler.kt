@@ -123,9 +123,12 @@ object Scheduler {
         if (s.keepalive_enabled && hour in s.keepalive_hours) once("keepalive", hour) { LogBus.log("token 保活：上游接口未接入，跳过") }
         if (s.blackcat_enabled && hour in s.blackcat_hours) once("blackcat", hour) { LogBus.log("夜猫子：上游接口未接入，跳过") }
 
+        // 键的形态是 "<name>-<yyyy-MM-dd>-<hour>"，所以判「今天的键」必须用 **contains**：
+        // 原实现用 endsWith(日期)，对任何键恒为 false → 触发阈值时把**当天所有**幂等标记
+        // 一起删掉，同一小时的 checkin/growth/streak 会在下一分钟再跑一遍（重复请求上游）。
         if (ranToday.size > 500) {
             val today = dayFmt()
-            ranToday.keys.removeIf { !it.endsWith(today) }
+            ranToday.keys.removeIf { !it.contains("-$today-") }
         }
     }
 

@@ -30,7 +30,9 @@ object Durations {
         val str = s.trim()
         str.toLongOrNull()?.let { return it }
         var i = 0
-        var total = 0L
+        // 用 Double 累加：原来直接相加 `(num * mult).toLong()`，`"500ms"` 会得到 0 秒
+        // —— 配置里写毫秒就等于「没有冷却」，静默失效且很难发现。
+        var totalSec = 0.0
         var matched = false
         while (i < str.length) {
             val start = i
@@ -49,11 +51,13 @@ object Durations {
                 "d" -> 86400.0
                 else -> return defSeconds
             }
-            total += (num * mult).toLong()
+            totalSec += num * mult
             matched = true
-            if (unit == "ms") { /* keep */ }
         }
-        return if (matched) total else defSeconds
+        if (!matched) return defSeconds
+        val secs = totalSec.toLong()
+        // 亚秒（如 "500ms"）向上取整到 1 秒：宁可略长，也不静默变成「无冷却」。
+        return if (secs <= 0 && totalSec > 0) 1L else secs
     }
 
     fun format(seconds: Long): String {

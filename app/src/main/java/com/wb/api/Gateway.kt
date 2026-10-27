@@ -245,7 +245,10 @@ object Gateway {
             failStart(if (why.contains("in use", true) || why.contains("EADDRINUSE", true)) "端口 $port 已被占用" else why)
             return
         }
-        boundPort = port
+        // 只有**本次真的新绑**才刷新实际端口：已在运行时 start() 早退返回 false，
+        // 此时配置端口可能已被改成别的值（尚未重启），写进 boundPort 就等于对外
+        // 公布一个没人监听的地址。
+        if (r.getOrDefault(false)) boundPort = port
         setRunning(true)
     }
 

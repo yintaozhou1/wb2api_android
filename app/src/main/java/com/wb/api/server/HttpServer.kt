@@ -247,13 +247,27 @@ class EmbeddedHttpServer(
     @Volatile private var watchdog: Thread? = null
     private val running = AtomicBoolean(false)
 
-    fun start() {
-        if (running.get()) return
+    /**
+     * @return true = 本次真的完成了 bind（新监听）；false = 已经在跑，什么都没做。
+     *
+     * 返回值的用处：调用方据此决定要不要更新「实际监听端口」。原实现无返回值，
+     * `Gateway.startServer()` 在「已在运行」的早退路径上照样把 boundPort 改成配置端口 ——
+     * 用户改了端口配置（未重启）再点一次启动，浮窗/通知/面板就会显示一个没人监听的地址。
+     */
+    fun start(): Boolean {
+        if (running.get()) return false
         val ss = ServerSocket()
         ss.reuseAddress = true
         // 显式 backlog=128（默认 50 偏小）：建连突发时内核认可更多待处理连接，
         // 与「不排队、只快速失败」的策略配套，避免客户端 connect 阶段就失败。
-        ss.bind(InetSocketAddress("0.0.0.0", portProvider()), 128)
+        // bind 失败必须自己关掉 socket：端口被占用时用户通常会连点几次「启动」，
+        // 每失败一次就漏一个 fd（对象被丢弃后只能等 Cleaner 回收）。
+        try {
+            ss.bind(InetSocketAddress("0.0.0.0", portProvider()), 128)
+        } catch (e: Throwable) {
+            runCatching { ss.close() }
+            throw e
+        }
         serverSocket = ss
         running.set(true)
         // 工作池：**每个连接要么立刻拿到线程，要么立刻被拒绝**。
@@ -306,6 +320,7 @@ class EmbeddedHttpServer(
         wd.start()
         val acct = accountConcurrency().trim().let { if (it.isEmpty()) "" else " · $it" }
         LogBus.log("http server listening on 0.0.0.0:${portProvider()}（连接并发 $HTTP_MAX_THREADS$acct）")
+        return true
     }
 
     /**
@@ -478,12 +493,21 @@ class EmbeddedHttpServer(
         return out.toByteArray()
     }
 
+    /**
+     * 解析 query string。
+     *
+     * `URLDecoder.decode` 对畸形转义（`?a=%`、`?a=%zz`）抛 IllegalArgumentException；
+     * 原来这会冒到 `handle()` 的兜底 catch，只写一行日志、**不回任何响应**就掐断连接
+     * （客户端看到的是「连接被重置」而不是 400）。现在逐项容错：坏参数按原文保留。
+     */
     private fun parseQuery(q: String): Map<String, String> =
         q.split('&').mapNotNull {
             if (it.isBlank()) return@mapNotNull null
             val i = it.indexOf('=')
-            if (i < 0) it to "" else URLDecoder.decode(it.substring(0, i), "UTF-8") to URLDecoder.decode(it.substring(i + 1), "UTF-8")
+            if (i < 0) urlDecode(it) to "" else urlDecode(it.substring(0, i)) to urlDecode(it.substring(i + 1))
         }.toMap()
+
+    private fun urlDecode(s: String): String = runCatching { URLDecoder.decode(s, "UTF-8") }.getOrDefault(s)
 }
 
 // ---------------- 路由与处理器 ----------------

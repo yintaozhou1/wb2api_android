@@ -69,7 +69,21 @@ object ChatHandler {
      *
      * @param sent 是否**已向客户端发送过任何数据**（响应头 / 字节）。SSE 一旦发出字节就无法
      *   再改状态码，因此只有 sent=false 的失败才允许换号重试（对客户端无痕）。
+     * @param errKind / errStatus / errBody 首帧前失败时的**真实原因**。没有它们时，轮转耗尽后
+     *   `runPipeline` 只能拿 lastKind=NONE 去 mapError，最终报「号都挂了」（no_healthy_account），
+     *   而实际可能是渠道校验 / 模型配额 / 内容拦截 —— 错误文案指向错误的方向，用户无从判断。
      */
+    internal data class Hop(
+        val ok: Boolean,
+        val promptTokens: Long = 0,
+        val completionTokens: Long = 0,
+        val totalTokens: Long = 0,
+        val sent: Boolean = false,
+        val errKind: ErrKind = ErrKind.NONE,
+        val errStatus: Int = 0,
+        val errBody: String = "",
+    )
+
     /**
      * 取上游响应的字节流。`okhttp3.Response.body` 是**可空**的：正常网络响应几乎总有 body，
      * 但「2xx 且无 body」在极端/异常路径下可能出现 —— 原实现四处用 `resp.body!!`，一旦落空
@@ -79,14 +93,6 @@ object ChatHandler {
     private fun bodyStreamOf(resp: okhttp3.Response): java.io.InputStream =
         resp.body?.byteStream()
             ?: throw UpstreamException(ErrKind.SERVER, resp.code, "上游返回 2xx 但响应体为空")
-
-    internal data class Hop(
-        val ok: Boolean,
-        val promptTokens: Long = 0,
-        val completionTokens: Long = 0,
-        val totalTokens: Long = 0,
-        val sent: Boolean = false,
-    )
 
     // ============================================================
     // 入口
@@ -259,6 +265,13 @@ object ChatHandler {
                         if (hop.sent) {
                             Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                             return
+                        }
+                        // 把这一跳的真实失败原因留到「轮转耗尽」时用：否则客户端只会看到
+                        // 通用 503 no_healthy_account（首帧 6004/11128 的语义会全丢）。
+                        if (hop.errKind != ErrKind.NONE) {
+                            lastKind = hop.errKind
+                            lastStatus = hop.errStatus
+                            lastBody = hop.errBody
                         }
                         LogBus.log("$realm|$model uid=${auth.uid.take(8)} 首帧前失败 -> 换号重试")
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
@@ -635,7 +648,10 @@ object ChatHandler {
                         val kind = Classify.frame(effectivePayload)
                         noteError(auth, kind, 200, model, effectivePayload)
                         LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 首帧 error/内嵌失败 kind=$kind -> 换号重试")
-                        return Hop(ok = false, sent = false)
+                        return Hop(
+                            ok = false, sent = false,
+                            errKind = kind, errStatus = 200, errBody = effectivePayload,
+                        )
                     }
                     beginOnce()
                 }
@@ -675,7 +691,10 @@ object ChatHandler {
             if (!started) {
                 // 整个流没有任何 data 帧（上游空流 / 首帧前断开）→ 无痕，换号重试
                 LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游空流/首帧前断开 -> 换号重试")
-                return Hop(ok = false, sent = false)
+                return Hop(
+                    ok = false, sent = false,
+                    errKind = ErrKind.SERVER, errStatus = 502, errBody = "upstream empty stream",
+                )
             }
             if (errFrame == null) {
                 // 收尾：吐出修复器里暂扣的尾部正文（未命中标记时就是原样）。
@@ -1756,7 +1775,10 @@ object ChatHandler {
                     LogBus.log("| # $realm/$model responses DSML 还原 ${fed.second.size} 个调用（非流式）：${fed.second.joinToString { it.name }}")
                 }
             }
-            val truncated = finish == "length" || (finish == null && !sawDone)
+            // 与 chat 非流式同一口径：**未见 [DONE] 就是断流**，此时即使上游给了
+            // finish_reason=tool_calls，arguments 也可能只剩半截 JSON —— 原样下发会让客户端
+            // JSON.parse 失败、会话卡死（chat 路径早就这么判，Responses 这里漂移了）。
+            val truncated = finish == "length" || !sawDone
             val calls = toolCalls.toSortedMap().values.toList()
             val kept = if (truncated) calls.filter { !isTruncatedArgs(it.args.toString()) } else calls
             val obj = envelope(

@@ -137,7 +137,7 @@ object Up {
     /** 新手礼包（blackcat.go:73）。 */
     const val P_CLAIM_GIFT = "/billing/meter/claim-gift"
 
-    /** 桌面客户端 UA：WorkBuddy 5.8.3 内嵌 CLI 2.161.0。 */
+    /** 桌面客户端 UA：WorkBuddy 5.8.3 内嵌 CLI 2.176.0（与 [DEFAULT_CLI_VERSION] 同源）。 */
     const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.176.0"
     /** Web 端浏览器 UA（desktop.go:267）。 */
     const val UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"

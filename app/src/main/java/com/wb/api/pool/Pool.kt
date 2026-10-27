@@ -87,7 +87,9 @@ class AccountPool(
 
     // WAF IP 级 fail-fast（**按 realm 分桶**：原来 CN 与 global 共用一份，任一 realm 触发
     // 会把另一个 realm 一起停摆 60s，属跨域误伤）。
-    private val wafHits = ConcurrentHashMap<String, ArrayDeque<Long>>()
+    // 值存 (时间戳, uid)：判据是「60s 内 ≥2 个**不同**账号被 WAF」，不是「≥2 次」——
+    // 单账号池里一个号重试两次就触发 realm 级闸门，等于自己把自己停 60 秒（注释与实现曾不符）。
+    private val wafHits = ConcurrentHashMap<String, ArrayDeque<Pair<Long, String>>>()
     private val wafActiveUntil = ConcurrentHashMap<String, Long>()
 
     // state.json 落盘节流（原实现每个成功请求都整份写盘）。
@@ -233,9 +235,15 @@ class AccountPool(
         return scored.last().first
     }
 
-    fun acquire(uid: String): Boolean {
-        val a = inFlight.computeIfAbsent(uid) { AtomicInteger(0) }
-        return a.incrementAndGet() > 0
+    /**
+     * 占一个在途名额。
+     *
+     * 原实现 `return incrementAndGet() > 0` 恒为 true（增量后必然 > 0），且唯一调用点
+     * 忽略返回值 —— 是个会误导后来者的假判据。「是否超上限」只能在**选号时**判
+     * （见 pick 的 inFlightFull），这里只做计数。
+     */
+    fun acquire(uid: String) {
+        inFlight.computeIfAbsent(uid) { AtomicInteger(0) }.incrementAndGet()
     }
 
     fun release(uid: String) {
@@ -575,9 +583,9 @@ class AccountPool(
         val t = now()
         val dq = wafHits.computeIfAbsent(realm) { ArrayDeque() }
         synchronized(dq) {
-            dq.addLast(t)
-            while (dq.isNotEmpty() && dq.first() < t - 60) dq.removeFirst()
-            if (dq.size >= 2) wafActiveUntil[realm] = t + 60
+            dq.addLast(t to uid)
+            while (dq.isNotEmpty() && dq.first().first < t - 60) dq.removeFirst()
+            if (dq.mapTo(HashSet()) { it.second }.size >= 2) wafActiveUntil[realm] = t + 60
         }
     }
 
@@ -638,7 +646,14 @@ class AccountPool(
         val s = store.stateOf(uid)
         // 禁用是比「暂停选号」更强的终态：置禁用时顺手清掉暂停（对齐上游 disableLocked），
         // 否则解禁后会残留一个「已暂停」，与用户看到的状态不符。
-        store.putState(s.copy(disabled = disabled, paused = if (disabled) false else s.paused))
+        // 解禁时把冷却**类型**一起清掉：cool_until 早已过期但 cool_kind 残留
+        // （session_dead / account_banned）会让后续「只延长不缩短」的判定与
+        // `channel_block` 自愈逻辑按错误的种类走。禁用时不写 cool_kind，故只清不设。
+        store.putState(s.copy(
+            disabled = disabled,
+            paused = if (disabled) false else s.paused,
+            cool_kind = if (!disabled && s.cool_until <= now()) "" else s.cool_kind,
+        ))
         store.saveState(sticky)
     }
 
@@ -937,16 +952,23 @@ class AccountPool(
 
     /** 某模型请求成功：清除 11102 负缓存（对齐 Go BlockModelClear）。 */
     fun clearModelBlock(uid: String, model: String) {
-        val s = store.stateOf(uid)
-        // 成功是「该模型此刻可服务」的最强证据：11102 负缓存与 14003 短冷却一起清
-        // （后者本就是 10~60s 的临时停车，成功即证明不必再等）。
-        val filtered = s.rate_limited_models.filterNot {
-            it.model == model && (it.kind == "model_unavailable" || it.kind == "model_busy")
+        // 必须走 withStateLock：这条是「成功路径」，与并发失败路径的 onError（同一个
+        // rate_limited_models 台账）会真实并发。裸读-改-写会用旧快照整体覆盖，
+        // 把另一路刚写入的 6004/11102 负缓存抹掉（或把刚清掉的 block 写回）。
+        val changed = store.withStateLock {
+            val s = store.stateOf(uid)
+            // 成功是「该模型此刻可服务」的最强证据：11102 负缓存与 14003 短冷却一起清
+            // （后者本就是 10~60s 的临时停车，成功即证明不必再等）。
+            val filtered = s.rate_limited_models.filterNot {
+                it.model == model && (it.kind == "model_unavailable" || it.kind == "model_busy")
+            }
+            if (filtered.size != s.rate_limited_models.size) {
+                store.putState(s.copy(rate_limited_models = filtered))
+                true
+            } else false
         }
-        if (filtered.size != s.rate_limited_models.size) {
-            store.putState(s.copy(rate_limited_models = filtered))
-            store.saveState(sticky)
-        }
+        // 落盘放锁外（与 onError/onSuccess 同一规范，避免 Store→Pool 锁序）
+        if (changed) persistThrottled()
     }
 
     /** 账号恢复时刻（无任何冷却为 0）。 */

@@ -107,14 +107,24 @@ class Store(private val context: Context) {
 
     // ---------------- 账号 ----------------
 
+    /**
+     * 从磁盘重读账号。
+     *
+     * **不能 clear() 再回填**：`saveAuth`（token 刷新）会在 HTTP 线程并发写同一个 authCache，
+     * clear 与回填之间写入的新凭证会被丢掉 —— 内存里退回旧 token，下一个请求再撞一次 401，
+     * 白跑一次求证（还要吃 30s 软冷却）。这里改为「读进临时 map → 覆盖合并 → 只淘汰磁盘上
+     * 已不存在的 uid」，任何时刻都不会出现「缓存被清空」的中间态。
+     */
     fun loadAuths(): List<AuthEntry> {
-        authCache.clear()
+        val fresh = HashMap<String, AuthEntry>()
         authDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }?.forEach { f ->
             runCatching {
                 val e = AppJson.decodeFromString(AuthEntry.serializer(), f.readText())
-                if (e.uid.isNotBlank()) authCache[e.uid] = e
+                if (e.uid.isNotBlank()) fresh[e.uid] = e
             }.onFailure { LogBus.log("[sys] 读取账号失败 ${f.name}: ${it.message}") }
         }
+        authCache.putAll(fresh)
+        authCache.keys.retainAll(fresh.keys)
         return authCache.values.toList()
     }
 
