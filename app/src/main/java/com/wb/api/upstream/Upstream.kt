@@ -29,7 +29,16 @@ import java.util.concurrent.TimeUnit
 
 /** 上游常量：base URL / path / UA / 稳定派生（与 Go 源码逐字对齐）。 */
 object Up {
-    const val CHAT_BASE_CN = "https://copilot.tencent.com"
+    /**
+     * CN 对话/模型主域 = 官方**桌面端** endpoint（上游 741cf5971，2026-10-26）。
+     *
+     * 旧值 copilot.tencent.com 是官方 NetworkFailover 里的**备选**入口，不是主入口。
+     * 生产实测（同一账号）：/v3/config、billing 汇总、chat 三条路径两个域返回一致，
+     * 而 workbuddy.cn 对海外出口也不重置握手 —— 主入口走它更稳，copilot 保留为末位兜底。
+     */
+    const val CHAT_BASE_CN = "https://www.workbuddy.cn"
+    /** CN 对话域**末位**兜底（官方 NetworkFailover 备选入口）。 */
+    const val CHAT_BASE_CN_ALT = "https://copilot.tencent.com"
     const val BILLING_BASE_CN = "https://www.codebuddy.cn"
     const val WEB_BASE_CN = "https://www.workbuddy.cn"
     const val GLOBAL_BASE = "https://www.workbuddy.ai"
@@ -49,8 +58,14 @@ object Up {
     const val DEFAULT_CLIENT_VERSION_CN = "5.8.3"
     const val DEFAULT_CLIENT_VERSION_GLOBAL = "5.8.4"
     /** 官方内置 CLI 版本（两版分发包同一值）。 */
-    /** 官方 CLI 版本（2026-10-24 起为 2.174.0）：UA 的 `CLI/<v>` 段与登录链接的 version 同源。 */
-    const val DEFAULT_CLI_VERSION = "2.174.0"
+    /**
+     * 官方 CLI 版本（2026-10-26 起为 2.176.0）：UA 的 `CLI/<v>` 段与登录链接的 version 同源。
+     *
+     * 上游注释：官方 CLI 把自身 package version 写进授权链接的 version，并以
+     * `?platform=CLI&version=` 打 console/auth/risk-context —— **版本串确实进风控判定**，
+     * 落后两个小版本时登录页会按旧客户端渲染并埋点。上游 CLI 日更，此常量跟 dist-tag latest 走。
+     */
+    const val DEFAULT_CLI_VERSION = "2.176.0"
 
     /** 按 realm 取生效的客户端版本。 */
     fun clientVersion(realm: String): String =
@@ -121,11 +136,9 @@ object Up {
     const val P_APPEARANCE_SET = "/v2/user-asset/appearance/set"
     /** 新手礼包（blackcat.go:73）。 */
     const val P_CLAIM_GIFT = "/billing/meter/claim-gift"
-    /** 活动补偿（blackcat.go:86）。 */
-    const val P_CLAIM_COMPENSATION = "/billing/meter/claim-compensation"
 
     /** 桌面客户端 UA：WorkBuddy 5.8.3 内嵌 CLI 2.161.0。 */
-    const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.174.0"
+    const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.176.0"
     /** Web 端浏览器 UA（desktop.go:267）。 */
     const val UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
     /** 小程序口径头值（tasks.go:35）。 */
@@ -146,11 +159,19 @@ object Up {
      * global → [workbuddy.ai]。
      */
     fun billingBases(realm: String): List<String> =
-        if (realm == "global") listOf(GLOBAL_BASE) else listOf(BILLING_BASE_CN, CHAT_BASE_CN)
+        if (realm == "global") listOf(GLOBAL_BASE)
+        else listOf(BILLING_BASE_CN, CHAT_BASE_CN, CHAT_BASE_CN_ALT)
 
-    /** 对话/模型域 base 候选：CN → [copilot.tencent.com, codebuddy.cn]；global → [workbuddy.ai]。 */
+    /**
+     * 对话/模型域 base 候选：CN → [workbuddy.cn, codebuddy.cn, copilot.tencent.com]；
+     * global → [workbuddy.ai]。
+     *
+     * 主域 2026-10-26 起换成官方桌面端 endpoint（见 [CHAT_BASE_CN]）；后两档是兜底，
+     * 顺序按「实测可用度」排：codebuddy.cn 的 API 路由在部分网络下 404，故排第二而非第一。
+     */
     fun chatBases(realm: String): List<String> =
-        if (realm == "global") listOf(GLOBAL_BASE) else listOf(CHAT_BASE_CN, BILLING_BASE_CN)
+        if (realm == "global") listOf(GLOBAL_BASE)
+        else listOf(CHAT_BASE_CN, BILLING_BASE_CN, CHAT_BASE_CN_ALT)
 
     /**
      * Web 域 base 候选（领奖 / web 指纹上报）：CN → [www.workbuddy.cn]；global → [workbuddy.ai]。
@@ -337,6 +358,18 @@ enum class ErrKind {
      * 短暂轮换 + 退避自愈，两者代价不对称）。
      */
     CHANNEL_BLOCK,
+
+    /**
+     * 6020「queue.waiting.title」/ 6021「queue.full.title」：上游**渠道级**排队 / 队列满
+     * （上游 client.go，2026-10-24 实案）。
+     *
+     * 这是**容量信号**，不是账号或模型限流：
+     *  - 罚号会与「全冷却兜底」互相喂（兜底把冷却号再送上游 → 又撞 6021 → 又续订 600s），
+     *    把几秒的排队放大成整段时间全量 429；
+     *  - 换号也没用（排的是**渠道**队列，不是某个号），所以既不罚号也不轮转。
+     * 处置：原样 503 透传上游文案 + 短 Retry-After，让客户端几秒后重试。
+     */
+    UPSTREAM_BUSY,
 }
 
 data class DeviceAuth(val state: String, val authUrl: String, val realm: String)
@@ -1735,13 +1768,6 @@ class UpstreamClient(
         runCatching { parseEnvelope(r.text)["credit"]?.primTextOrNull()?.toLongOrNull() ?: 0L }.getOrNull()
     }
 
-    /** 领活动补偿（billing 域），blackcat.go:85-95。有则领，无则 null。 */
-    suspend fun claimCompensation(auth: AuthEntry): Long? = withContext(Dispatchers.IO) {
-        val r = billingCall(auth.realm, auth, "POST", listOf(Up.P_CLAIM_COMPENSATION), "{}")
-        if (!r.ok) return@withContext null
-        runCatching { parseEnvelope(r.text)["credit"]?.primTextOrNull()?.toLongOrNull() ?: 0L }.getOrNull()
-    }
-
     // ---------- 网络自检（诊断） ----------
 
     /**
@@ -1878,6 +1904,17 @@ object Classify {
             b.contains("model is busy") || b.contains("currently busy")
     }
 
+    /**
+     * 6020 / 6021 渠道级排队判据（`ErrKind.UPSTREAM_BUSY` 的唯一入口）。
+     *
+     * 任意状态码都认（防上游换状态码）；只认结构化 `"code":` 键，requestId 等字段
+     * 恰好含 6021 不会误伤（[codeMarker] 的四态匹配）。两个 code 同族同判。
+     */
+    fun isUpstreamBusy(body: String): Boolean {
+        val b = body.lowercase().replace("\\", "")
+        return codeMarker(b, "6020") || codeMarker(b, "6021")
+    }
+
     fun isChannelBlock(body: String): Boolean {
         // 去掉反斜杠再判：SSE error 帧与网关 sendError 会把上游信封**再序列化一层**，
         // 于是 `"code":11128` 以 `\"code\":11128` 的形态出现（实测报文就是这样）。
@@ -1899,6 +1936,9 @@ object Classify {
             // 也吞成 ACCOUNT_FAULT → 旧实现据此 **Disable** 账号（把健康号永久踢出池子），
             // 一次渠道校验失败就把整池打空，表象就是「所有请求 503 no_healthy_account」。
             isChannelBlock(body) -> ErrKind.CHANNEL_BLOCK
+            // 0.55 6020/6021 渠道级排队：**先于模型繁忙与 429 兜底**（上游 client.go 同序）。
+            // 按 SOFT_RATE 罚号会与全冷却兜底互相喂，把几秒排队放大成整段 429。
+            isUpstreamBusy(body) -> ErrKind.UPSTREAM_BUSY
             // 0.6 14003 模型繁忙：**必须先于 429 兜底**，否则会被当成账号级限流
             // （soft_rate 600s 起），把间歇抖动放大成整分钟不可用（上游 issue #46）。
             isModelBusy(body) -> ErrKind.MODEL_BUSY

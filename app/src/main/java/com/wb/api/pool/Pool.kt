@@ -66,6 +66,13 @@ data class ModelBlockStatus(
     val until: Long = 0,
     /** 因此被挡的账号数。 */
     val count: Int = 0,
+    /**
+     * 每个被挡账号的锁因（与 [count] 等长）。
+     *
+     * 为什么需要：[reason] 只有一条，无法区分「全池都是同一个原因」。调用方要按需聚合
+     * 判断（例如「是不是清一色用量配额 6004」——那决定客户端该不该重试，见 mapError）。
+     */
+    val reasons: List<String> = emptyList(),
 )
 
 /** 可信生成窗口下限：扣除 TTFB 后不足此值即认为「生成时长不可测」，退回端到端耗时。 */
@@ -433,6 +440,12 @@ class AccountPool(
                 val cool = (base * (1L shl (streak - 1).coerceIn(0, 8))).coerceAtMost(cap)
                 ns = ns.copy(cool_until = t + cool, cool_kind = "channel_block", soft_streak = streak)
                 log("channel_block(keep account)", uid, model, cool)
+            }
+            ErrKind.UPSTREAM_BUSY -> {
+                // 6020/6021 渠道级排队（上游 client.go）：**不罚号、不改任何冷却台账**。
+                // 换号同样排同一渠道队列，罚号只会与全冷却兜底互相喂、把几秒排队放大成
+                // 整段 429（2026-10-15 6021 实案：18 次全落 soft_rate）。只留错误计数。
+                log("upstream_busy(no penalty)", uid, model, 0)
             }
             ErrKind.MODEL_BUSY -> {
                 // 14003「模型繁忙」（上游 issue #46）：**模型级**短冷却，不碰账号级。
@@ -823,6 +836,7 @@ class AccountPool(
         var count = 0
         var reason = ""
         var until = 0L
+        val reasons = ArrayList<String>()
         store.auths().forEach { a ->
             // 选号是**分 realm** 的，判定也必须分 realm：否则 cn 号全被某模型冷却、
             // global 号只因账号级冷却而选不到时，会被误报成「该模型全池不可用」，
@@ -833,12 +847,19 @@ class AccountPool(
             val lim = s.rate_limited_models.firstOrNull { it.model == model && it.until > t }
                 ?: return ModelBlockStatus()   // 还有账号能服务这个模型 → 不是模型级阻塞
             count++
-            if (reason.isBlank()) reason = lim.reason.ifBlank { lim.kind }
-            // 取**最早**解封：那才是「再等多久值得重试」的答案。
-            if (lim.until > 0 && (until == 0L || lim.until < until)) until = lim.until
+            reasons += lim.reason.ifBlank { lim.kind }
+            // 取**最早**解封：那才是「再等多久值得重试」的答案。reason 跟着这条走，
+            // 保证「原因」与「解锁时刻」出自**同一个账号**，不会张冠李戴（上游 10-26）。
+            if (lim.until > 0 && (until == 0L || lim.until < until)) {
+                until = lim.until
+                reason = lim.reason.ifBlank { lim.kind }
+            }
         }
         if (count == 0) return ModelBlockStatus()   // 池里压根没有可参与选号的账号
-        return ModelBlockStatus(blocked = true, reason = reason, until = until, count = count)
+        // 全都没有解封时刻（14003 的有界退避不写墙钟）：退回第一条，保持
+        // 「blocked 必有 reason」的既有语义。
+        if (reason.isBlank()) reason = reasons.firstOrNull().orEmpty()
+        return ModelBlockStatus(blocked = true, reason = reason, until = until, count = count, reasons = reasons)
     }
 
     /**

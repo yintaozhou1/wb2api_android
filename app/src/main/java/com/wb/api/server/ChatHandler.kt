@@ -55,6 +55,9 @@ object ChatHandler {
     private val failFastKinds = setOf(
         ErrKind.BAD_PARAMS, ErrKind.CONTENT_BLOCKED,
         ErrKind.PROMPT_TOO_LONG, ErrKind.IMAGE_INVALID,
+        // 6020/6021 渠道级排队：排的是**渠道**队列，换号无用（上游 client.go 同判）。
+        // 轮转只会多打 N 次上游、把几秒排队拖成客户端可见的长时间等待。
+        ErrKind.UPSTREAM_BUSY,
     )
 
     private val frameWhitelist = setOf(
@@ -1051,15 +1054,30 @@ object ChatHandler {
      * 记），而网关没有别的续期点 —— 不主动刷的话，每次自然过期都会先撞一次 401。
      *
      * 只在临期 120s 内动作；刷新失败就按原凭证继续（那条 401 路径会兜住）。
+     *
+     * **必须与 401 求证共用同一把 uid 锁**（[sessionLocks]）：token 到期那一刻，
+     * `max_in_flight` 个并发请求会**同时**命中临期分支，各自拿同一份旧 RT 去刷 ——
+     * 上游轮换 refresh_token 后，后到的几条必然 4xx，被 `proveSession` 判 DEAD 后
+     * 就把一个健康号永久禁用了（与 1.6.7 修掉的是同一个误杀，只是从另一个入口复发）。
+     * 锁内二次读最新凭证：别人已经刷过就直接用新的，不再重复打 refresh。
      */
     private fun ensureFreshToken(auth: AuthEntry): AuthEntry {
         if (auth.refresh_token.isBlank() || auth.access_expires_at <= 0) return auth
-        val now = System.currentTimeMillis() / 1000
-        if (auth.access_expires_at - now > 120) return auth
-        val renewed = runCatching { runBlocking { Gateway.upstream.refresh(auth) } }.getOrNull() ?: return auth
-        Gateway.store.saveAuth(renewed)
-        LogBus.log("| token 临期（${auth.access_expires_at - now}s），已主动续期 uid=${auth.uid.take(8)}")
-        return renewed
+        if (auth.access_expires_at - System.currentTimeMillis() / 1000 > 120) return auth
+        val lock = sessionLocks.computeIfAbsent(auth.uid) { Any() }
+        return synchronized(lock) {
+            val latest = runCatching { Gateway.store.getAuth(auth.uid) }.getOrNull() ?: auth
+            val now = System.currentTimeMillis() / 1000
+            if (latest.access_expires_at - now > 120) {
+                // 别的线程刚刷过（或本地凭证已被更新）：直接用最新的，不再打 refresh。
+                return@synchronized latest
+            }
+            val renewed = runCatching { runBlocking { Gateway.upstream.refresh(latest) } }.getOrNull()
+                ?: return@synchronized auth
+            Gateway.store.saveAuth(renewed)
+            LogBus.log("| token 临期（${latest.access_expires_at - now}s），已主动续期 uid=${auth.uid.take(8)}")
+            renewed
+        }
     }
 
     private fun mapError(
@@ -1071,7 +1089,7 @@ object ChatHandler {
         selectionFailed: Boolean,
         realm: String = "",
     ) {
-        val msg = body.ifBlank {
+        var msg = body.ifBlank {
             when (kind) {
                 ErrKind.SOFT_RATE -> "rate limited: all accounts are cooling down, please wait a moment and try again"
                 ErrKind.WAF_BLOCK -> "upstream WAF blocked"
@@ -1079,6 +1097,7 @@ object ChatHandler {
                 ErrKind.SESSION_DEAD -> "all accounts session dead, re-login required"
                 ErrKind.CHANNEL_BLOCK -> "channel verification failed: upstream rejected the " +
                     "request as non-official-client traffic (HTTP 400 code=11-128/11128 request illegal)"
+                ErrKind.UPSTREAM_BUSY -> "upstream queue is full, please retry in a few seconds"
                 else -> "all accounts are temporarily unavailable, please retry later"
             }
         }
@@ -1101,10 +1120,15 @@ object ChatHandler {
             // 14003 模型繁忙：503 + Retry-After（上游客户端契约）。与 11102 的区别是
             // 「等一会儿再来」而不是「换模型」—— 语义错了客户端会做错决策。
             ErrKind.MODEL_BUSY -> 503 to "model_busy"
+            // 6020/6021：上游容量信号（排队/队列满），原样 503 透传（上游 client.go 同口径）。
+            ErrKind.UPSTREAM_BUSY -> 503 to "upstream_busy"
             else -> 503 to "no_healthy_account"
         }
         var finalCode = code
         var finalErrCode = errCode
+        // 配额语义专用：`error.type = insufficient_quota` + `error.code = <上游业务码，数字>`。
+        var finalErrType = "api_error"
+        var finalNumCode: Int? = null
         var hint = when {
             errCode == "no_healthy_account" ->
                 "no healthy account available in pool; check /status or retry later"
@@ -1126,7 +1150,27 @@ object ChatHandler {
         // 那种情况必须保持 waf_ip_blocked 的语义，不能改写成 model_unavailable。
         if (selectionFailed && kind != ErrKind.WAF_BLOCK) {
             val block = Gateway.pool.modelBlocked(model, realm)
-            if (block.blocked) {
+            if (block.blocked && modelBlockAllQuota(block)) {
+                // ★ 全池该模型的锁**清一色是「用量配额」**（6004/6000：上游明说用量已超出
+                //   频率限制、将在某时刻重置）。重置前重试**必然同样失败**，所以按配额语义
+                //   回 429 + 上游原文，且**不发 Retry-After**：客户端普遍把它当「睡多久」的
+                //   指令（官方 CLI 直接 delayMs = retry-after×1000，不设上限），把几十分钟
+                //   的冷却原样报出去就是客户端静默挂起 —— 比报错更难排查（上游 handler.go）。
+                //   与下面的「忙」分支互补：那个是瞬时（等就有效），这个是额度窗口（等到重置前都无效）。
+                finalCode = 429
+                finalErrCode = "insufficient_quota"
+                finalErrType = "insufficient_quota"
+                finalNumCode = if (block.reason.contains("6000")) 6000 else 6004
+                if (block.reason.isNotBlank()) msg = block.reason
+                val sb = StringBuilder("model_quota: ${block.count} account(s) hit this model's usage limit")
+                if (block.until > 0) {
+                    val iso = java.time.OffsetDateTime.ofInstant(
+                        java.time.Instant.ofEpochSecond(block.until), java.time.ZoneId.systemDefault(),
+                    )
+                    sb.append("; resets at ").append(iso)
+                }
+                hint = sb.toString()
+            } else if (block.blocked) {
                 // 14003「忙」与 11102「不可用」是两种语义：前者等几秒就好，后者换模型才行。
                 // 统一报 400 model_unavailable 会让客户端直接放弃（上游 issue #46 的实测）。
                 val busy = block.reason.contains("14003") || block.reason.contains("model_busy") ||
@@ -1154,9 +1198,31 @@ object ChatHandler {
             } else 0L
         } else 0L
         if (retryAfter > 0) {
-            res.sendError(finalCode, msg, finalErrCode, hint, mapOf("Retry-After" to retryAfter.toString()))
+            res.sendError(
+                finalCode, msg, finalErrCode, hint,
+                mapOf("Retry-After" to retryAfter.toString()),
+                errType = finalErrType, numCode = finalNumCode,
+            )
         } else {
-            res.sendError(finalCode, msg, finalErrCode, hint)
+            res.sendError(finalCode, msg, finalErrCode, hint, errType = finalErrType, numCode = finalNumCode)
+        }
+    }
+
+    /**
+     * 全池该模型被挡是否**清一色是「用量配额」**（6004 / 6000）。
+     *
+     * 判据复用既有分类：[com.wb.api.upstream.RateLimit.isModelRateLimit] 命中 6004 与
+     * 「6000 + 换模型提示」，14003 不在其中；再用 isModelBusy 排除瞬时繁忙。两者合起来
+     * 就是「模型级限流、但不是瞬时忙」= 额度窗口。
+     *
+     * 锁因不是上游原文（本端标记串、11102 混锁等）时不认，保持旧的兜底行为 ——
+     * 错把「模型不存在」报成「额度耗尽」会让用户去等一个永远不会恢复的窗口。
+     */
+    private fun modelBlockAllQuota(block: com.wb.api.pool.ModelBlockStatus): Boolean {
+        if (!block.blocked || block.reasons.isEmpty()) return false
+        return block.reasons.all { r ->
+            com.wb.api.upstream.RateLimit.isModelRateLimit(r) &&
+                !com.wb.api.upstream.Classify.isModelBusy(r)
         }
     }
 

@@ -44,9 +44,10 @@ object StreakService {
         val tag = a.uid.take(8)
         // ① 补签保连登
         makeupYesterday(a, tag)
-        // ② 礼包 / 补偿（每号一次，无则静默）
+        // ② 新手礼包（每号一次，无则静默）。
+        //    官方「活动补偿」端点已下线（上游 5367e78dc 删除 compensation.go）：继续打它
+        //    只会每轮多一次必然失败的请求，日志里还会留下误导性的错误行。
         Gateway.upstream.claimGift(a)?.let { LogBus.log("streak-bonus $tag: 新手礼包 +${it}c") }
-        Gateway.upstream.claimCompensation(a)?.let { LogBus.log("streak-bonus $tag: 补偿 +${it}c") }
 
         // ③ 兑换所有已解锁档位
         val full = Gateway.upstream.growthStreakStatus(a)

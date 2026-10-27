@@ -48,9 +48,50 @@ data class Req(
     fun header(n: String) = headers[n.lowercase()]
 }
 
-class Res(private val out: OutputStream) {
+/**
+ * 写侧停滞探针（BIO 服务器的最后一个黑洞）。
+ *
+ * 为什么需要：`Socket.soTimeout` 只作用于**读**，Java 也没有 `SO_SNDTIMEO` 的 API。
+ * 手机切网 / WiFi 断开 / 对端被 kill 时，客户端不会发 RST，`out.write()` 会一直阻塞到
+ * 内核 TCP 重传耗尽（默认分钟级）；而本服务器是「一连接一线程 + SynchronousQueue，
+ * 满 32 个立刻回 503」——几个静默客户端就能把工作线程全钉住，表现为「网关假死、
+ * 重启才好」。看门狗只盯「正在写」的瞬间（读上游时的长空闲不受影响，TTFB 几分钟也安全）。
+ */
+class WriteGuard(private val sock: Socket) {
+    @Volatile private var sinceNs = 0L
+
+    fun begin() { sinceNs = System.nanoTime() }
+
+    fun end() { sinceNs = 0L }
+
+    /** 从开始写到现在是否已超过阈值（未在写时恒 false）。 */
+    fun stalled(): Boolean {
+        val s = sinceNs
+        return s != 0L && System.nanoTime() - s > WRITE_STALL_NS
+    }
+
+    /** 关掉 socket：把阻塞中的 write 打断成 IOException。 */
+    fun kill() {
+        runCatching { sock.close() }
+    }
+}
+
+/** 单次写阻塞超过 90s 视为对端已死（正常帧写满 64KB 缓冲区是毫秒级）。 */
+private const val WRITE_STALL_NS = 90_000_000_000L
+
+class Res(private val out: OutputStream, private val guard: WriteGuard? = null) {
     private var sent = false
     private var chunked = false
+
+    /** 所有写出口统一经过这里：只有真正阻塞的那段被看门狗计时。 */
+    private inline fun writing(block: () -> Unit) {
+        guard?.begin()
+        try {
+            block()
+        } finally {
+            guard?.end()
+        }
+    }
 
     private fun statusText(c: Int) = when (c) {
         200 -> "OK"; 204 -> "No Content"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 404 -> "Not Found"
@@ -70,15 +111,14 @@ class Res(private val out: OutputStream) {
         sb.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
         for ((k, v) in extra) sb.append(k).append(": ").append(v).append("\r\n")
         sb.append("Connection: keep-alive\r\n\r\n")
-        out.write(sb.toString().toByteArray())
-        out.flush()
+        writing { out.write(sb.toString().toByteArray()); out.flush() }
         sent = true
     }
 
     fun sendBytes(code: Int, bytes: ByteArray, ctype: String, extra: Map<String, String> = emptyMap()) {
         if (sent) return
         writeHeaders(code, ctype, bytes.size.toLong(), false, extra)
-        out.write(bytes); out.flush()
+        writing { out.write(bytes); out.flush() }
     }
 
     fun sendText(code: Int, text: String, ctype: String = "text/plain; charset=utf-8", extra: Map<String, String> = emptyMap()) =
@@ -87,18 +127,29 @@ class Res(private val out: OutputStream) {
     fun sendJson(code: Int, el: JsonElement, extra: Map<String, String> = emptyMap()) =
         sendBytes(code, AppJson.encodeToString(JsonElement.serializer(), el).toByteArray(), "application/json", extra)
 
+    /**
+     * @param errType        `error.type`（默认 api_error；配额语义用 insufficient_quota）。
+     * @param numCode        非空时 `error.code` 用**数字**（如上游业务码 6004/6000）。
+     *
+     * 为什么 code 要能是数字：客户端是按**数字业务码**决定能不能重试的（官方 CLI 对 429
+     * 只重试 14003/6001/6002/6005/6006 这类瞬时码，6004 在黑名单外）。把配额写成
+     * 字符串 "insufficient_quota" 会让它既认不出配额也认不出业务码（上游 handler.go）。
+     */
     fun sendError(
         code: Int,
         message: String,
         errCode: String = "api_error",
         hint: String = "",
         extra: Map<String, String> = emptyMap(),
+        errType: String = "api_error",
+        numCode: Int? = null,
     ) {
         val obj = buildJsonObject {
             put("error", buildJsonObject {
                 put("message", JsonPrimitive(message))
-                put("type", JsonPrimitive("api_error"))
-                put("code", JsonPrimitive(errCode))
+                put("type", JsonPrimitive(errType))
+                if (numCode != null) put("code", JsonPrimitive(numCode))
+                else put("code", JsonPrimitive(errCode))
                 if (hint.isNotBlank()) put("gateway_hint", JsonPrimitive(hint))
             })
         }
@@ -116,13 +167,15 @@ class Res(private val out: OutputStream) {
         // 空串会被编码成 "0\\r\\n\\r\\n" —— 那是 chunked 的**终止符**，会静默关闭流。
         if (s.isEmpty()) return
         val b = s.toByteArray()
-        out.write("${Integer.toHexString(b.size)}\r\n".toByteArray())
-        out.write(b); out.write("\r\n".toByteArray()); out.flush()
+        writing {
+            out.write("${Integer.toHexString(b.size)}\r\n".toByteArray())
+            out.write(b); out.write("\r\n".toByteArray()); out.flush()
+        }
     }
 
     fun endStream() {
         if (!chunked) return
-        out.write("0\r\n\r\n".toByteArray()); out.flush()
+        writing { out.write("0\r\n\r\n".toByteArray()); out.flush() }
         chunked = false
     }
 
@@ -186,6 +239,12 @@ class EmbeddedHttpServer(
 
     /** 线程池随 start/stop 生命周期创建销毁（stop 时必须 shutdown，否则反复启停会累积线程）。 */
     @Volatile private var executor: ExecutorService? = null
+
+    /** 活跃连接的写探针（见 [WriteGuard]）；handle() 结束时移除。 */
+    private val guards = java.util.concurrent.ConcurrentHashMap.newKeySet<WriteGuard>()
+
+    /** 写侧看门狗（5s 一轮，只 close 真正卡住的那条连接）。 */
+    @Volatile private var watchdog: Thread? = null
     private val running = AtomicBoolean(false)
 
     fun start() {
@@ -228,6 +287,23 @@ class EmbeddedHttpServer(
             acceptThread = it
             it.start()
         }
+        val wd = Thread({
+            while (running.get()) {
+                try {
+                    Thread.sleep(5_000)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                for (g in guards) {
+                    if (g.stalled()) {
+                        // 阻塞中的 write 会立刻抛 IOException 让线程归位；这里只负责「拔管子」。
+                        runCatching { g.kill() }
+                    }
+                }
+            }
+        }, "http-write-watchdog").apply { isDaemon = true }
+        watchdog = wd
+        wd.start()
         val acct = accountConcurrency().trim().let { if (it.isEmpty()) "" else " · $it" }
         LogBus.log("http server listening on 0.0.0.0:${portProvider()}（连接并发 $HTTP_MAX_THREADS$acct）")
     }
@@ -275,6 +351,8 @@ class EmbeddedHttpServer(
         serverSocket = null
         runCatching { acceptThread?.interrupt() }
         acceptThread = null
+        runCatching { watchdog?.interrupt() }
+        watchdog = null
         // 修复线程泄漏：原实现只关 socket，keep-alive 处理线程（soTimeout 10 分钟）会长期存活。
         runCatching { executor?.shutdownNow() }
         executor = null
@@ -290,6 +368,8 @@ class EmbeddedHttpServer(
         // 60 s 也**短于**主流客户端（OkHttp 默认 5 min）—— 由服务端先关是 keep-alive 的正确
         // 方向（反之客户端会复用一条已被对端关闭的连接）。
         sock.soTimeout = 60_000
+        val guard = WriteGuard(sock)
+        guards += guard
         try {
             val input = BufferedInputStream(sock.getInputStream())
             val output = sock.getOutputStream()
@@ -297,10 +377,10 @@ class EmbeddedHttpServer(
                 val req = try {
                     readRequest(input)
                 } catch (_: RequestTooLargeException) {
-                    runCatching { Res(output).sendError(413, "request body too large") }
+                    runCatching { Res(output, guard).sendError(413, "request body too large") }
                     break
                 } ?: break
-                val res = Res(output)
+                val res = Res(output, guard)
                 try { handler(req, res) } catch (e: Throwable) {
                     LogBus.log("[sys] handler error: ${e.message}")
                     // 已进入流式输出时再写 500 会被 Res 的 `sent` 挡掉 —— 结果是「既没有错误响应、
@@ -318,6 +398,7 @@ class EmbeddedHttpServer(
             // 只能靠猜 —— 这正是本次超时问题排查困难的直接原因之一。
             LogBus.log("[sys] 连接处理异常：${e.javaClass.simpleName}: ${e.message}")
         } finally {
+            guards -= guard
             runCatching { sock.close() }
         }
     }
@@ -413,7 +494,10 @@ class Router {
         val path = req.path
         when {
             path == "/healthz" -> healthz(res)
-            path == "/v1/models" -> { if (auth(req, res)) models(res) }
+            // /v1/models 是**双协议共用**端点：Anthropic 官方 SDK 用 x-api-key，OpenAI 系
+            // 客户端用 Bearer。此前只挂 Bearer，于是「同一份 key 能调通 /v1/messages 却
+            // 列不出模型」（上游 dc75c04e2 的同款缺陷）。
+            path == "/v1/models" -> { if (auth(req, res, allowApiKey = true)) models(res) }
             path == "/v1/chat/completions" && req.method == "POST" -> { if (auth(req, res)) ChatHandler.handle(req, res) }
             // OpenAI Responses API（/v1/responses）：与 chat/completions 等价能力，走同一套
             // 选号/改写/错误分类/用量统计管线（见 ChatHandler.handleResponses）。
@@ -425,11 +509,14 @@ class Router {
         }
     }
 
-    private fun auth(req: Req, res: Res): Boolean {
+    private fun auth(req: Req, res: Res, allowApiKey: Boolean = false): Boolean {
         val key = Gateway.store.config.api_key
         if (key.isBlank()) return true
         val h = req.header("authorization") ?: ""
-        val token = if (h.startsWith("Bearer ")) h.substring(7) else ""
+        var token = if (h.startsWith("Bearer ")) h.substring(7) else ""
+        // Anthropic 口径：空 Authorization 时才看 x-api-key（Bearer 优先，避免两种头并存时
+        // 被次要头覆盖）。仅 models 这类双协议端点开启，其余端点保持单一 Bearer 语义。
+        if (token.isEmpty() && allowApiKey) token = req.header("x-api-key").orEmpty()
         val ok = constantTimeEquals(token, key)
         if (!ok) res.sendError(401, "missing or invalid API key", "invalid_api_key")
         return ok
