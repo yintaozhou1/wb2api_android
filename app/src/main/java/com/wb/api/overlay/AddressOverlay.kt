@@ -48,6 +48,10 @@ import kotlin.math.roundToInt
  * 位置：**水平方向最多拖出 2/3**（屏幕内始终留 1/3 可见，否则会变成「拖出去就再也抓不回来」），
  * 垂直方向保持整颗在屏内（上下贴边就够了，不需要半出屏）。
  *
+ * 能出屏的**前提是 `FLAG_LAYOUT_NO_LIMITS`**（官方语义："allow window to extend outside of
+ * the screen"）：没有它时 WindowManager 会把 x/y 夹回显示区域，无论我们自己的 clamp 放多宽
+ * —— 1.6.8 只改了 clamp、没加这个 flag，所以表现仍是「拖不出屏」。
+ *
  * 主题：玻璃取值由 [GlassPill.applyTheme] 统一重算，两条触发路径 ——
  *  - 应用内主题切换（`ui.theme`）：[refreshTheme] 由 MainActivity 的 LaunchedEffect 调；
  *  - 系统深浅色切换（`ui.theme = system`）：`Application.registerComponentCallbacks`。
@@ -115,6 +119,22 @@ object AddressOverlay {
     private fun clampY(y: Int, h: Int, screenH: Int): Int =
         y.coerceIn(0, (screenH - h).coerceAtLeast(0))
 
+    /**
+     * 屏幕**物理**尺寸（含状态栏 / 导航栏）。
+     *
+     * 不能用 `resources.displayMetrics`：它是「应用可用区域」（已扣掉系统栏），而窗口加上
+     * `FLAG_LAYOUT_NO_LIMITS` 后坐标系原点在**屏幕左上角**、也不再受系统栏约束 —— 两者混用
+     * 会让底部边界少算一条导航栏的高度（表现为「拖到底还差一条缝」、或反过来把胶囊夹到
+     * 导航栏上面去）。API 30+ 的 `currentWindowMetrics.bounds` 返回整屏，minSdk 32 可直接用。
+     */
+    private fun screenSize(ctx: Context): Pair<Int, Int> {
+        val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        val b = runCatching { wm?.currentWindowMetrics?.bounds }.getOrNull()
+        if (b != null && b.width() > 0 && b.height() > 0) return b.width() to b.height()
+        val m = ctx.resources.displayMetrics
+        return m.widthPixels to m.heightPixels
+    }
+
     fun isShowing(): Boolean = view?.isAttachedToWindow == true
 
     /**
@@ -175,9 +195,12 @@ object AddressOverlay {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            // 不抢焦点（浮窗只展示，不接输入法）；NOT_TOUCH_MODAL 让窗口外的触摸照常落到下层。
+            // 不抢焦点（浮窗只展示，不接输入法）；NOT_TOUCH_MODAL 让窗口外的触摸照常落到下层；
+            // **FLAG_LAYOUT_NO_LIMITS 允许窗口超出屏幕边界** —— 这是「能拖出屏 2/3」的唯一开关，
+            // 少了它系统会把 x/y 夹回屏内（1.6.8 的根因，见类头注释）。
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -186,6 +209,9 @@ object AddressOverlay {
         }
         attachTouch(pill, lp, wm, prefs)
         if (!runCatching { wm.addView(pill, lp) }.isSuccess) {
+            // 回调是刚注册的：addView 失败时窗口根本不存在，留着它只会让主题变更路径
+            // 继续持有并调用一个不会显示的 View（单例场景泄漏有限，但注册与注销要成对）。
+            runCatching { app.unregisterComponentCallbacks(configCallbacks) }
             LogBus.log("[overlay] 添加浮窗失败（ROM 拒绝？）")
             return
         }
@@ -222,13 +248,19 @@ object AddressOverlay {
         val v = view ?: return
         val lp = params ?: return
         val wm = windowManager ?: return
-        val m = v.resources.displayMetrics
-        val nx = clampX(lp.x, v.width, m.widthPixels)
-        val ny = clampY(lp.y, v.height, m.heightPixels)
+        val (sw, sh) = screenSize(v.context)
+        val nx = clampX(lp.x, v.width, sw)
+        val ny = clampY(lp.y, v.height, sh)
         if (nx != lp.x || ny != lp.y) {
             lp.x = nx
             lp.y = ny
             runCatching { wm.updateViewLayout(v, lp) }
+            // 夹取结果要**写回**：否则持久化的还是那个越界值，每次启动都要再夹一次；
+            // 更糟的是「换到更小的屏幕/横屏」时，旧值会一直把胶囊压在边缘外。
+            runCatching {
+                v.context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    .edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
+            }
         }
     }
 
@@ -276,9 +308,9 @@ object AddressOverlay {
                     // 超过 6dp 才算拖动：手指抖动不该把「点击」变成「位移」。
                     if (!dragging && (abs(dx) > slop || abs(dy) > slop)) dragging = true
                     if (dragging) {
-                        val m = v.resources.displayMetrics
-                        lp.x = clampX(startX + dx.roundToInt(), v.width, m.widthPixels)
-                        lp.y = clampY(startY + dy.roundToInt(), v.height, m.heightPixels)
+                        val (sw, sh) = screenSize(v.context)
+                        lp.x = clampX(startX + dx.roundToInt(), v.width, sw)
+                        lp.y = clampY(startY + dy.roundToInt(), v.height, sh)
                         runCatching { wm.updateViewLayout(v, lp) }
                     }
                     true
