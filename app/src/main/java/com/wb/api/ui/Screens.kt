@@ -1453,8 +1453,9 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                         }
                         WbHintBlock(
                             title = "仍未接入的上游任务",
-                            body = "猫猫旅行 / token 保活 / 夜猫子：上游对应接口尚未接入，" +
+                            body = "猫猫旅行 / token 保活：上游对应接口尚未接入，" +
                                 "开关保留在配置中但不会执行（日志会注明「未接入」）。" +
+                                "夜猫子任务已随上游下架从排程中移除。" +
                                 "活跃上报与连登管家（兑换/抽奖/补签/礼包）已接入，跟随签到排程自动执行。",
                             icon = MiuixIcons.Info,
                         )
@@ -1528,6 +1529,15 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
             item {
                 WbSection("关于") {
                     WbRow("版本", "${com.wb.api.BuildConfig.VERSION_NAME} (versionCode ${com.wb.api.BuildConfig.VERSION_CODE})", showDivider = true)
+                    // 版本公告在远程分享页里（文本含「最新版x.x.x」），这里给一个手动入口：
+                    // 自动检查只在冷启动跑一次，用户想主动确认时不必反复重启应用。
+                    WbRow(
+                        "检查更新",
+                        "远程公告",
+                        chevron = true,
+                        onClick = { vm.checkUpdate(manual = true) },
+                        showDivider = true,
+                    )
                     // 长文本用「标签在上、值在下」的两行布局，避免单行挤压重叠。
                     WbKeyValueRow(
                         "支持的接口",

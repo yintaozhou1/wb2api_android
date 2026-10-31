@@ -10,6 +10,7 @@ import com.wb.api.core.LogBus
 import com.wb.api.core.LogEntry
 import com.wb.api.core.Net
 import com.wb.api.core.UiCfg
+import com.wb.api.core.UpdateCheck
 import com.wb.api.data.CredentialTransfer
 import com.wb.api.data.ImportReport
 import com.wb.api.model.AuthEntry
@@ -110,6 +111,52 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toast(msg: String) { _message.value = msg }
     fun consumeMessage() { _message.value = null }
+
+    /**
+     * 启动时检查一次远程版本公告。
+     *
+     * 放在 ViewModel 的 init 里（而不是 Activity.onCreate）：进程内只会跑一次，Activity
+     * 因配置变化重建时不会重复请求、也不会重复弹提示。检查本身是网络 IO，由
+     * [UpdateCheck.fetch] 自己切到 IO 线程，这里不阻塞启动。
+     */
+    init {
+        checkUpdate(manual = false)
+    }
+
+    /**
+     * 检查远程「最新版x.x.x」公告。
+     *
+     * @param manual true = 用户主动点「检查更新」：没新版本/没解析到标记都要给明确回执；
+     *   false = 启动时自动检查：只在**有新版本**或**网络失败**时提示（后者是用户明确要求
+     *   的行为：连不上/超时要说出来），其余情况只写日志，避免每次冷启动都弹一句「已是最新」。
+     */
+    fun checkUpdate(manual: Boolean = true) {
+        viewModelScope.launch {
+            val cur = com.wb.api.BuildConfig.VERSION_NAME
+            if (manual) toast("正在检查更新…")
+            when (val r = UpdateCheck.fetch()) {
+                is UpdateCheck.Result.Latest -> {
+                    val newer = UpdateCheck.compareVersions(r.version, cur) > 0
+                    when {
+                        newer -> {
+                            toast("发现新版本 ${r.version}（当前 $cur）· 设置 → 关于 → 检查更新")
+                            LogBus.log("[sys] 检测到新版本 ${r.version}（当前 $cur）")
+                        }
+                        manual -> toast("已是最新版本（$cur）")
+                        else -> LogBus.log("[sys] 版本检查：当前 $cur 已是最新（远程 ${r.version}）")
+                    }
+                }
+                UpdateCheck.Result.NoMarker -> {
+                    if (manual) toast("检查更新失败：远程文本里没有「最新版x.x.x」")
+                    else LogBus.log("[sys] 检查更新：远程文本里没有「最新版x.x.x」")
+                }
+                is UpdateCheck.Result.Failed -> {
+                    // 自动检查也提示：用户明确要求「网络异常/超时要说出来」。
+                    toast("检查更新失败：${r.reason}")
+                }
+            }
+        }
+    }
 
     /**
      * 装配一份概览快照。
