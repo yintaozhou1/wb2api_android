@@ -121,7 +121,6 @@ object Scheduler {
         }
         if (s.travel_enabled && hour in s.travel_hours) once("travel", hour) { LogBus.log("猫猫旅行：上游接口未接入，跳过") }
         if (s.keepalive_enabled && hour in s.keepalive_hours) once("keepalive", hour) { LogBus.log("token 保活：上游接口未接入，跳过") }
-        if (s.blackcat_enabled && hour in s.blackcat_hours) once("blackcat", hour) { LogBus.log("夜猫子：上游接口未接入，跳过") }
 
         // 键的形态是 "<name>-<yyyy-MM-dd>-<hour>"，所以判「今天的键」必须用 **contains**：
         // 原实现用 endsWith(日期)，对任何键恒为 false → 触发阈值时把**当天所有**幂等标记

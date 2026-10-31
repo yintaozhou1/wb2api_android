@@ -42,7 +42,15 @@ object Up {
     const val BILLING_BASE_CN = "https://www.codebuddy.cn"
     const val WEB_BASE_CN = "https://www.workbuddy.cn"
     const val GLOBAL_BASE = "https://www.workbuddy.ai"
-    const val ORIGIN_CN = "https://www.codebuddy.cn"
+    /**
+     * Web 层 Origin/Referer 基础域（CN）。
+     *
+     * 2026-10-28 上游修正：`www.codebuddy.cn` 是 CodeBuddy CLI 时代的遗留；5.9.3 桌面端真机
+     * 全量扫描（661 条带 Origin/Referer 的请求）里**没有一条**把它当 Origin，一律是
+     * `www.workbuddy.cn`（/console/auth/risk-context、/billing/ide/trial 等）。
+     * codebuddy.cn 只是 billing 的 API 主机名，从不当 Origin。
+     */
+    const val ORIGIN_CN = "https://www.workbuddy.cn"
     const val ORIGIN_GLOBAL = "https://www.workbuddy.ai"
 
     /** 设备授权 / 插件域仍用插件 CLI 形态（该端点按插件口径签发）。 */
@@ -55,8 +63,8 @@ object Up {
      * 两版发版节奏不同，**必须按 realm 分开**：国际版用 CN 的版本号会与上游实际分发包对不上
      * （旧实现共用 5.5.4，是「UA 指纹过期」的一部分）。
      */
-    const val DEFAULT_CLIENT_VERSION_CN = "5.8.3"
-    const val DEFAULT_CLIENT_VERSION_GLOBAL = "5.8.4"
+    const val DEFAULT_CLIENT_VERSION_CN = "5.9.3"
+    const val DEFAULT_CLIENT_VERSION_GLOBAL = "5.9.4"
     /** 官方内置 CLI 版本（两版分发包同一值）。 */
     /**
      * 官方 CLI 版本（2026-10-26 起为 2.176.0）：UA 的 `CLI/<v>` 段与登录链接的 version 同源。
@@ -137,8 +145,17 @@ object Up {
     /** 新手礼包（blackcat.go:73）。 */
     const val P_CLAIM_GIFT = "/billing/meter/claim-gift"
 
-    /** 桌面客户端 UA：WorkBuddy 5.8.3 内嵌 CLI 2.176.0（与 [DEFAULT_CLI_VERSION] 同源）。 */
-    const val UA_DESKTOP = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.176.0"
+    /**
+     * 桌面分发包**内置**的 CLI 版本（与 npm 上 `@tencent-ai/codebuddy-code` 的 latest 不是同一个东西）。
+     *
+     * 上游 10-30 拆包取证：5.9.3/5.9.4 桌面端 `cli/package.json` 的 `@genie/agent-cli` 是
+     * **2.165.0**，真机 chat UA 的 `CLI/<v>` 段就是它；而授权链接与 CLI 侧 UA 用的是 npm
+     * dist-tag latest（[DEFAULT_CLI_VERSION]）。两者混用会让 UA 与实际分发包对不上。
+     */
+    const val BUILTIN_CLI_VERSION = "2.165.0"
+
+    /** 桌面客户端 UA：WorkBuddy 5.9.3 内嵌 CLI 2.165.0。 */
+    const val UA_DESKTOP = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
     /** Web 端浏览器 UA（desktop.go:267）。 */
     const val UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
     /** 小程序口径头值（tasks.go:35）。 */
@@ -194,7 +211,7 @@ object Up {
     fun workBuddyUA(
         realm: String,
         clientVersion: String = clientVersion(realm),
-        cliVersion: String = DEFAULT_CLI_VERSION,
+        cliVersion: String = BUILTIN_CLI_VERSION,
     ): String {
         val brand = if (realm == "global") "workbuddy-ai" else "WorkBuddy"
         return "WorkBuddy/$clientVersion $brand/$clientVersion CLI/$cliVersion"
@@ -209,7 +226,7 @@ object Up {
      * 该端点按 UA 家族下发不同模型集合，官方真机同时出现两种形态，故两路都要探。
      */
     fun workBuddyUaLite(realm: String): String =
-        "WorkBuddy/${clientVersion(realm)} CLI/$DEFAULT_CLI_VERSION"
+        "WorkBuddy/${clientVersion(realm)} CLI/$BUILTIN_CLI_VERSION"
 
     /** 按 uid + 用途稳定派生 36 hex 标识（跨重启恒定，账号间互异）。 */
     fun stableId(uid: String, purpose: String): String {
@@ -1838,7 +1855,17 @@ private val JsonPrimitive.strOrNull: String?
  *  9. WAF 403（无业务信封）→ 其余 4xx/5xx。
  */
 object Classify {
-    private val hardMarkers = listOf("insufficient", "余额不足", "额度不足", "quota exceeded")
+    /**
+     * 计费耗尽文案（HARD_CREDIT 的**非 402/429** 兜底判据）。
+     *
+     * 原来第一项是裸词 `"insufficient"`：`insufficient permissions` / `insufficient_scope`
+     * （400/403 的鉴权/权限错误）都会命中 → 被当成「余额耗尽」把账号冷却到次日 04:00
+     * （近 24 小时出池）。这里只保留**配额/余额专属**的说法，且都是完整词。
+     */
+    private val hardMarkers = listOf(
+        "insufficient_quota", "insufficient quota", "insufficient balance",
+        "insufficient credit", "quota exceeded", "余额不足", "额度不足", "积分不足",
+    )
     private val softRateMarkers = listOf("rate limit", "rate-limiting", "too many requests", "限流", "请求过于频繁")
     private val sessionDeadMarkers = listOf("12153", "session dead", "token expired", "invalid token", "登录过期")
     private val accountFaultMarkers = listOf("11140", "request illegal", "14017", "trial not activated")
@@ -1913,6 +1940,25 @@ object Classify {
     fun isUpstreamBusy(body: String): Boolean {
         val b = body.lowercase().replace("\\", "")
         return codeMarker(b, "6020") || codeMarker(b, "6021")
+    }
+
+    /**
+     * 6020/6021 排队响应的重试等待（秒）。上游把口径放在 **body 的 `data.retry_after`**
+     * （整数秒）而不是 Retry-After 头（2026-10-28 真机：429 + code 6020，data 里是
+     * queue_position/queue_size/retry_after/estimated_wait，头侧没有任何等待信息）。
+     *
+     * 只认结构化 data 字段：msg 是 i18n 键（`queue.waiting.title`）无数值可解析，
+     * 其余字段恰好含数字也不会误伤。解析不到返回 0，由调用方回落本地兜底。
+     */
+    fun parseQueueRetryAfter(body: String): Long {
+        if (body.isBlank()) return 0
+        val n = runCatching {
+            AppJson.parseToJsonElement(body).jsonObject["data"]?.objOrNull()
+                ?.get("retry_after")?.primText()?.toDoubleOrNull()
+        }.getOrNull() ?: return 0
+        if (n <= 0) return 0
+        // 防上游口径漂移时把天文数字带回来（调用方还会再按 Retry-After 上限夹一次）
+        return n.coerceAtMost(3600.0).toLong()
     }
 
     fun isChannelBlock(body: String): Boolean {

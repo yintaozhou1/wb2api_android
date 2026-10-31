@@ -194,7 +194,7 @@ class AccountPool(
         val candidates = pool.filter { a ->
             !cooling(store.stateOf(a.uid)) && inFlightOf(a.uid) < max
         }
-        if (candidates.isEmpty()) return fallbackEarliestExpiry(pool, max)
+        if (candidates.isEmpty()) return fallbackEarliestExpiry(pool, max, model)
         // 过滤模型级限额
         // 过滤模型级限额：**候选全部**对该模型处于模型级冷却时返回 null，不硬挑一个冷却中的
         // 号去撞限流 —— 对齐 Go pick（模型冷却的号一律排除、pick 返回 nil），由 handler 上报
@@ -415,7 +415,11 @@ class AccountPool(
                 // 该模型请求成功即由 clearModelBlock 清除（对齐 Go BlockModelBackoff/Clear）。
                 val prev = s.rate_limited_models.firstOrNull { it.model == model && it.kind == "model_unavailable" }
                 val hits = (prev?.hits ?: 0) + 1
-                val ttl = minOf(6L * 3600 * (1L shl (hits - 1).coerceIn(0, 4)), 24L * 3600)
+                // TTL 从 6h/24h 缩到 **2m/10m**（上游 10-27）：11102 不总是「这号真没这模型」，
+                // 路径级问题、上游瞬时抖动、分类误判都会触发它。原参数把一次偶发误判放大成
+                // (账号,模型) 锁死 6 小时，多号轮一圈就是整池该模型不可用；实测同号两分钟就
+                // 能恢复。退避仍保留：真没模型的号会升到封顶 10 分钟，不会退化成每请求重试。
+                val ttl = minOf(2L * 60 * (1L shl (hits - 1).coerceIn(0, 4)), 10L * 60)
                 ns = ns.copy(rate_limited_models = s.rate_limited_models.filter { it.model != model } +
                     ModelLimit(model, "model_unavailable", reset_at = 0, until = t + ttl, hits = hits, reason = why))
                 log("model_blocked", uid, model, ttl)
@@ -636,9 +640,11 @@ class AccountPool(
     fun revive(uid: String) {
         val s = store.stateOf(uid)
         // 「解冻」是全清：暂停选号一并解除（对齐上游 state.go 的 Revive）。
+        // 解冻是**全清**：含 breaker_retry（熔断退避的指数），否则解冻后第一次熔断仍按
+        // 历史触发次数退避（最长 6 小时），与「解冻 = 从头开始」的语义相反。
         store.putState(s.copy(disabled = false, paused = false, breaker_until = 0, breaker_fail_streak = 0,
-            degrade_until = 0, degrade_fail_streak = 0, cool_until = 0, cool_kind = "", soft_streak = 0,
-            rate_limited_models = emptyList()))
+            breaker_retry = 0, degrade_until = 0, degrade_fail_streak = 0, cool_until = 0, cool_kind = "",
+            soft_streak = 0, rate_limited_models = emptyList()))
         store.saveState(sticky)
     }
 
@@ -833,6 +839,24 @@ class AccountPool(
     fun inFlightFull(uid: String, realm: String): Boolean = inFlightOf(uid) >= realmMaxInFlight(realm)
 
     /**
+     * 「此刻选不到号**只是**因为号都在途占满」（对齐上游 `SlotWaitForRealm`，issue #117）。
+     *
+     * 与「号在冷却」的区别很大：冷却要等到已知的解封时刻，而在途占满只要有一个请求收尾
+     * 就腾出名额（通常几十毫秒到几秒）。两号池、单号 max_in_flight=5 时，第 6 个并发请求
+     * 原来直接 503，其实只差几百毫秒。
+     *
+     * 判据只用 healthyForModel（已含 disabled/paused/冷却/模型冷却）+ 在途是否满：
+     * 这样「等下去不会变好」的情形（冷却、积分保底）不会被误判成值得等。
+     */
+    fun slotWaitForModel(model: String, realm: String = ""): Boolean {
+        val max = realmMaxInFlight(realm)
+        return store.auths().any { a ->
+            if (realm.isNotEmpty() && a.realm != realm) return@any false
+            healthyForModel(a.uid, model) && inFlightOf(a.uid) >= max
+        }
+    }
+
+    /**
      * 该模型此刻是否被**全池**模型级冷却挡住（**本端自造**的上报能力：上游 Go 无同名方法）。
      *
      * 为什么需要它：选号返回 nil 有两种完全不同的成因 ——
@@ -986,11 +1010,20 @@ class AccountPool(
      * 在途未满的号里选「恢复最早」的一个继续尝试。余额耗尽号（hard_credit，等次日 04:00
      * 签到）必 402，参与只会浪费一轮轮换，故排除。池内无可用号才返回 nil。
      */
-    private fun fallbackEarliestExpiry(pool: List<com.wb.api.model.AuthEntry>, max: Int): com.wb.api.model.AuthEntry? {
+    private fun fallbackEarliestExpiry(
+        pool: List<com.wb.api.model.AuthEntry>,
+        max: Int,
+        model: String,
+    ): com.wb.api.model.AuthEntry? {
         val t = now()
         val usable = pool.filter { a ->
             val s = store.stateOf(a.uid)
-            !(s.cool_kind == "hard_credit" && s.cool_until > t) && inFlightOf(a.uid) < max
+            !(s.cool_kind == "hard_credit" && s.cool_until > t) &&
+                inFlightOf(a.uid) < max &&
+                // 兜底也不能绕过**模型级**冷却（上游 pick.go 10-27）：兜底是为了「号可能已经
+                // 恢复」，而不是为了「绕过这个模型被限」。少了这一条，「全池该模型冷却」会被
+                // 兜底挑一个冷却中的号去白撞一次上游，还顺带把 modelBlocked() 的判据搅乱。
+                (model.isBlank() || s.rate_limited_models.none { it.model == model && it.until > t })
         }
         val best = usable.minByOrNull { expiryOf(store.stateOf(it.uid)) } ?: return null
         val exp = expiryOf(store.stateOf(best.uid))

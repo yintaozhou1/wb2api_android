@@ -55,9 +55,9 @@ object ChatHandler {
     private val failFastKinds = setOf(
         ErrKind.BAD_PARAMS, ErrKind.CONTENT_BLOCKED,
         ErrKind.PROMPT_TOO_LONG, ErrKind.IMAGE_INVALID,
-        // 6020/6021 渠道级排队：排的是**渠道**队列，换号无用（上游 client.go 同判）。
-        // 轮转只会多打 N 次上游、把几秒排队拖成客户端可见的长时间等待。
-        ErrKind.UPSTREAM_BUSY,
+        // 注意：6020/6021（ErrKind.UPSTREAM_BUSY）**不在这里**。上游 10-29（PR #108）做了
+        // 语义修正：实测同一模型同一分钟内既有 6021 也有成功（两个号连续 6021 后 33 秒就通），
+        // 说明**换号有意义**；因此恢复请求内轮转，终态改回 429 + Retry-After（见 mapError）。
     )
 
     private val frameWhitelist = setOf(
@@ -206,11 +206,17 @@ object ChatHandler {
         // 实际**服务成功**的那个账号。`tried` 是 HashSet（无插入序），用它取 `lastOrNull()`
         // 得到的是「哈希序最后一个」，会把用量记账到被淘汰的账号上（代码审查 P0-1）。
         var servedUid = ""
+        // HTTP 层是否真的把一个 **2xx** 交给了客户端（驱动 `/status` 的 http_success）。
+        // 不能再用 `hop.ok || hop.sent`：错误响应（4xx/5xx）发出后 sent 也是 true，
+        // 于是 http_success 恒等于 completed —— 指标失去意义（与注释的修复目标矛盾）。
+        var httpOk = false
         // 选号返回 null 的两种成因要分开报：这里记下「是否因选不到号而终止」，
         // 供 mapError 判定是不是「号都在、只是都对这个模型冷却」（上游 issue #102）。
         var selectionFailed = false
         // 「模型繁忙」只等一次的额度（上游 issue #46）：不占换号次数、等待期间不占在途名额。
         var busyWaited = false
+        // 「号都在途占满」只等一次的额度（上游 issue #117）：与上面同一套「不占换号次数」的语义。
+        var slotWaited = false
 
         try {
             var attempt = 0
@@ -228,6 +234,19 @@ object ChatHandler {
                             Thread.sleep(waitMs)
                             continue
                         }
+                    }
+                    // 号都在途占满（不是冷却）：腾出名额通常只要几十毫秒，等到就能继续。
+                    // 直接 503 会让「只差一个并发槽」的请求失败（issue #117）。
+                    if (!slotWaited && Gateway.pool.slotWaitForModel(model, realm)) {
+                        slotWaited = true
+                        val deadline = System.currentTimeMillis() + 10_000
+                        LogBus.log("$realm|$model 全池在途占满 → 等一个名额（最多 10s）后重试一次")
+                        while (System.currentTimeMillis() < deadline &&
+                            Gateway.pool.slotWaitForModel(model, realm)
+                        ) {
+                            Thread.sleep(50)
+                        }
+                        if (!Gateway.pool.slotWaitForModel(model, realm)) continue
                     }
                     selectionFailed = true
                     break
@@ -253,9 +272,27 @@ object ChatHandler {
                         null
                     }
                     if (resp != null && resp.isSuccessful) {
-                        hop = responder(res, resp, auth, model, realm, req, reqId, start)
+                        // responder 内部（读流 / 解析 / 序列化）抛异常时必须**落在轮转语义里**：
+                        // 原来这里没有 try，`bodyStreamOf` 抛出的「可分类上游异常」会直接冒到
+                        // HttpServer 的兜底 catch，变成一条匿名 500 —— 该号不被罚、也不换号，
+                        // 而 bodyStreamOf 的注释恰恰声称「可被上层按服务器错误处置」。
+                        hop = try {
+                            responder(res, resp, auth, model, realm, req, reqId, start)
+                        } catch (e: UpstreamException) {
+                            LogBus.log("$realm|$model responder 异常 uid=${auth.uid.take(8)} kind=${e.kind}: ${e.message}")
+                            Gateway.pool.onTransportFailure(auth.uid, model, e.message ?: "responder")
+                            Hop(ok = false, sent = false, errKind = e.kind, errStatus = e.status, errBody = e.body)
+                        } catch (e: Throwable) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            LogBus.log("$realm|$model responder 异常 uid=${auth.uid.take(8)}: ${e.javaClass.simpleName} ${e.message}")
+                            Gateway.pool.onTransportFailure(auth.uid, model, e.message ?: e.javaClass.simpleName)
+                            Hop(ok = false, sent = false,
+                                errKind = ErrKind.SERVER, errStatus = 502,
+                                errBody = "responder: ${e.message ?: e.javaClass.simpleName}")
+                        }
                         if (hop.ok) {
                             servedUid = auth.uid
+                            httpOk = true
                             Gateway.pool.clearModelBlock(auth.uid, model)
                             Gateway.pool.stickyBind(sessionKey ?: reqId, auth.uid)
                             return
@@ -263,6 +300,8 @@ object ChatHandler {
                         // 失败但**尚未向客户端发送任何数据**（首帧前上游断流 / 首帧即 error 帧）：
                         // 这次尝试对客户端无痕，换号重试（SSE 发过字节后无法改状态码，故仅 sent=false 生效）。
                         if (hop.sent) {
+                            // 已发过 2xx 头（流式中途断掉）：HTTP 层确实成功过，但业务失败。
+                            httpOk = true
                             Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                             return
                         }
@@ -287,7 +326,7 @@ object ChatHandler {
                         noteError(auth, kind, resp.code, model, text, retryAfter)
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                         LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
-                        if (kind in failFastKinds) { mapError(res, kind, lastStatus, lastBody, model, false, realm); return }
+                        if (kind in failFastKinds) { mapError(res, kind, lastBody, model, false, realm); return }
                     }
                 } finally {
                     Gateway.pool.release(auth.uid)
@@ -295,13 +334,14 @@ object ChatHandler {
                 attempt++
                 if (attempt < MAX_ROTATE) Thread.sleep(backoff(attempt))
             }
-            mapError(res, lastKind, lastStatus, lastBody, model, selectionFailed, realm)
+            httpOk = false
+            mapError(res, lastKind, lastBody, model, selectionFailed, realm)
         } finally {
             val dur = System.currentTimeMillis() - start
             // 第二参 httpOk：HTTP 层面是否把一次成功响应交给了客户端 —— 正常完成（hop.ok）
             // 或已向客户端发出 2xx 流（hop.sent）都算。原实现硬编码 true，使 http_success
             // 恒等于 completed、该指标失去意义。
-            Gateway.noteRequestEnd(hop.ok, hop.ok || hop.sent, dur)
+            Gateway.noteRequestEnd(hop.ok, httpOk, dur)
             if (hop.ok) {
                 Gateway.store.appendUsage(UsageRecord(
                     t = System.currentTimeMillis() / 1000,
@@ -827,7 +867,7 @@ object ChatHandler {
             // 错误体**已经写回客户端** → 这里必须标记 sent=true：否则 runPipeline 会把它
             // 当成「首帧前失败」而换号重发，但 Res 已发出字节（sendBytes 里 `if (sent) return`），
             // 后续写入成为 no-op —— 最终「客户端拿到错误、网关却记为成功」并白白多打一次上游。
-            mapError(res, kind, 0, ef, model, false, realm)
+            mapError(res, kind, ef, model, false, realm)
             return Hop(ok = false, sent = true)
         }
 
@@ -1102,7 +1142,6 @@ object ChatHandler {
     private fun mapError(
         res: Res,
         kind: ErrKind,
-        status: Int,
         body: String,
         model: String,
         selectionFailed: Boolean,
@@ -1139,8 +1178,10 @@ object ChatHandler {
             // 14003 模型繁忙：503 + Retry-After（上游客户端契约）。与 11102 的区别是
             // 「等一会儿再来」而不是「换模型」—— 语义错了客户端会做错决策。
             ErrKind.MODEL_BUSY -> 503 to "model_busy"
-            // 6020/6021：上游容量信号（排队/队列满），原样 503 透传（上游 client.go 同口径）。
-            ErrKind.UPSTREAM_BUSY -> 503 to "upstream_busy"
+            // 6020/6021 渠道排队：回 **429 + Retry-After**（上游 10-29 修正，见 mapError 的
+            // retryAfter 分支）。不能回 503：上游对这两个形态本身回的就是 429，客户端对 429
+            // 才会按 Retry-After 自动排队重试；503 在多数 SDK 里是不可重试的服务端故障。
+            ErrKind.UPSTREAM_BUSY -> 429 to "upstream_busy"
             else -> 503 to "no_healthy_account"
         }
         var finalCode = code
@@ -1210,12 +1251,22 @@ object ChatHandler {
         // 模型繁忙/限流给 Retry-After：客户端按头退避远好过盲撞（上游契约）。
         // 只有**真的知道**解封时刻才发 Retry-After：账号级软冷却不写模型台账，
         // 此时 modelBlocked.until = 0 —— 硬给一个 1 秒反而误导客户端立刻重撞。
-        val retryAfter = if (finalErrCode == "model_busy" || finalErrCode == "rate_limit_exceeded") {
-            val block = Gateway.pool.modelBlocked(model, realm)
-            if (block.until > 0) {
-                (block.until - System.currentTimeMillis() / 1000).coerceIn(1, 60)
-            } else 0L
-        } else 0L
+        val retryAfter = when (finalErrCode) {
+            "model_busy", "rate_limit_exceeded" -> {
+                val block = Gateway.pool.modelBlocked(model, realm)
+                if (block.until > 0) {
+                    (block.until - System.currentTimeMillis() / 1000).coerceIn(1, 60)
+                } else 0L
+            }
+            // 6020/6021 排队：优先用上游给的口径（body 的 data.retry_after，6020 实测 40s），
+            // 拿不到按 5s 兜底；封顶 600s —— 客户端把这个头当「睡多久」的指令且不设上限，
+            // 报几十分钟出去就是静默挂起（比报错更难排查）。
+            "upstream_busy" -> {
+                val fromBody = Classify.parseQueueRetryAfter(body)
+                (if (fromBody > 0) fromBody else 5L).coerceIn(1, 600)
+            }
+            else -> 0L
+        }
         if (retryAfter > 0) {
             res.sendError(
                 finalCode, msg, finalErrCode, hint,
