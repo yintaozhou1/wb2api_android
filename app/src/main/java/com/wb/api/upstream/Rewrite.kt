@@ -72,7 +72,9 @@ object Rewrite {
         // 3.1) 客户端没给输出上限时，用模型元数据兜底：
         //      不是所有客户端都会带上限，缺省时上游行为不稳定（可能被截断或被拒），
         //      显式补一个「该模型声明的最大输出」更可预期。仅在客户端未指定时补，不覆盖用户值。
-        if (maxOutput > 0 && !obj.containsKey("max_tokens") && !obj.containsKey("max_completion_tokens")) {
+        // 只需判 max_tokens：`max_completion_tokens` 在上一步已被翻译或原样搬进 max_tokens
+        // （原判定 `!containsKey("max_completion_tokens")` 恒为真，是句废话）。
+        if (maxOutput > 0 && !obj.containsKey("max_tokens")) {
             obj["max_tokens"] = maxOutput
         }
         // 4) stream_options 缺省补 include_usage。
@@ -250,13 +252,31 @@ object Rewrite {
 
     // ---- max_completion_tokens 翻译 ----
 
+    /**
+     * `max_completion_tokens` → `max_tokens`。
+     *
+     * 关键点：**翻译失败也不能丢**。原实现只认 `Number`，于是 `"1000"`（字符串）、`0`、
+     * 小数、负数都被 remove 掉且不生成 `max_tokens`，随后 [prepare] 的「客户端没给上限」
+     * 兜底会补上**模型声明的最大输出** —— 用户想限制 1000 token，实际拿到数万 token 的
+     * 额度：费用与延迟都被放大，而日志里看不出（只记最终值）。
+     * 现在：数字（含字符串数字）正常翻译；认不出的原样放进 `max_tokens` 交给上游判
+     * （400 也比静默放大额度诚实）。
+     */
     private fun translateMaxCompletionTokens(obj: MutableMap<String, Any?>) {
         val hasAlias = obj.containsKey("max_completion_tokens")
         val alias = obj.remove("max_completion_tokens")
         if (!hasAlias) return
         if (obj.containsKey("max_tokens")) return
-        val v = (alias as? Number)?.toDouble() ?: return
-        if (v > 0 && v == Math.floor(v)) obj["max_tokens"] = v.toLong()
+        val v: Double? = when (alias) {
+            is Number -> alias.toDouble()
+            is String -> alias.trim().toDoubleOrNull()
+            else -> null
+        }
+        if (v != null && v > 0 && v == Math.floor(v)) {
+            obj["max_tokens"] = v.toLong()
+        } else if (alias != null && alias.toString().isNotBlank()) {
+            obj["max_tokens"] = alias
+        }
     }
 
     // ---- tool_choice 归一 ----
