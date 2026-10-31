@@ -12,6 +12,8 @@
 - 传输：**内嵌原生 HTTP 服务器**（自研 `ServerSocket` + 线程池，支持 SSE 分块转发）
 - 出站：**OkHttp** 直连官方桌面端 endpoint（CN 主域 `www.workbuddy.cn`，`codebuddy.cn` / `copilot.tencent.com` 兜底），Kotlin 重写请求改写与错误分类
 - 并发：**Kotlin 协程**；后台：**前台 Service** 常驻（Android 14+ 用 `specialUse`、12–13 用 `dataSync` —— 规避 Android 15 起 `dataSync` 的「24 小时内累计 6 小时」上限）
+- 版本公告：启动时拉取远程「最新版x.x.x」文本（正则解析 + 语义化版本比较），高于本地即提示；
+  网络异常/超时会明确回执，设置 → 关于 → 「检查更新」可手动重试
 
 ## 更新日志
 
@@ -53,6 +55,8 @@ Scaffold
 - 本地 `127.0.0.1` 网关，无外部依赖；`usesCleartextTraffic` 便于本地 SDK 接入。
 - 原生 WebView 承载 OAuth 页（非 HTML 布局 UI），并支持系统浏览器。
 - 明暗主题跟随系统；Miuix 原生动画与按压反馈。
+- 版本公告检测：独立 OkHttp（8s 超时、浏览器 UA）拉远程分享页 → 正则 `最新版\s*[vV]?\s*(\d+(?:\.\d+){1,3})`
+  取版本 → 按段数值比较（不按字典序，`1.10.0` 要判成比 `1.9.9` 新）。只在冷启动跑一次，不占网关连接池。
 
 ## 构建
 
