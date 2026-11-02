@@ -14,6 +14,11 @@
 - 并发：**Kotlin 协程**；后台：**前台 Service** 常驻（Android 14+ 用 `specialUse`、12–13 用 `dataSync` —— 规避 Android 15 起 `dataSync` 的「24 小时内累计 6 小时」上限）
 - 版本公告：启动时拉取远程「最新版x.x.x」文本（正则解析 + 语义化版本比较），高于本地即提示；
   网络异常/超时会明确回执，设置 → 关于 → 「检查更新」可手动重试
+- 模型目录：按 `/v3/config` 的 `data.agents[默认].models`（**官方客户端菜单口径**）裁剪 ——
+  去掉 `auto` / 付费变体 `paidId`、补 `fast/balanced/deep` 三个速度预设；不再把平台全量目录里的
+  内部路由变体、历史别名与已下架模型列给下游（CN 实测 58 条目录 → 17 项菜单）
+- 成长任务：设置页「成长任务」= 任务中心明细（标题 / 进度 / 奖励 / 状态）+ 单条领取 +
+  一键扫描（报名 → 行为事件点亮 → 回读 → 自动领奖，含动作表外任务的补领兜底）
 
 ## 更新日志
 
@@ -26,6 +31,8 @@
 |---|---|
 | `cmd/server` + `internal/server` | `Gateway.kt`、`server/HttpServer.kt`、`server/ChatHandler.kt` |
 | `internal/upstream` | `upstream/Upstream.kt`、`upstream/Rewrite.kt` |
+| `internal/upstream/clientpick.go` | `upstream/ClientPick.kt`（模型菜单口径） |
+| `internal/panel/autotask.go` + `taskcenter.go` | `server/GrowthService.kt`、`server/GrowthActions.kt` |
 | `internal/pool` | `pool/Pool.kt` |
 | `internal/auth` | `upstream/Upstream.kt`（设备授权）+ `data/Store.kt` |
 | `internal/scheduler` | `scheduler/Scheduler.kt` |
