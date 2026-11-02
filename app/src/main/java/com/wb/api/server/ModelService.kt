@@ -63,7 +63,12 @@ object ModelService {
                 }
             }
             if (result.isNotEmpty()) {
-                cache = result
+                // 某一路（某域）本次失败时**不要**用「只含成功域」的结果整份覆盖缓存：
+                // 一次瞬时失败会让另一个域的模型全部从列表里消失（用户看到「模型少了」，
+                // 10 分钟内不恢复）。没拿到的域沿用上一份缓存，下次刷新成功再替换。
+                val freshRealms = result.map { it.realm }.toSet()
+                val kept = cache.filter { it.realm !in freshRealms }
+                cache = result + kept
                 cachedAt = System.currentTimeMillis()
             }
             if (result.isNotEmpty()) result else cache
@@ -187,6 +192,47 @@ object ModelService {
         if (m.supported_efforts.isNotEmpty()) {
             put("reasoning_supported_efforts", buildJsonArray { m.supported_efforts.forEach { add(JsonPrimitive(it)) } })
             if (m.default_effort.isNotBlank()) put("reasoning_default_effort", JsonPrimitive(m.default_effort))
+        }
+
+        // ── models.dev 词表（纯追加，不覆盖上面任何字段）──
+        // 上游 internal/server/modelsdev_shape.go：原有旗标语义清楚，但只认
+        // models.dev / OpenRouter 词表的客户端（magpie 等）读不懂，会退化成纯文本模型。
+        // 这里补一份同义声明；没有数据源的字段（attachment / cost / release_date …）
+        // 一律不写——宁可缺字段，也不给错值（credits 是积分倍率，不是美元）。
+        put("modalities", buildJsonObject {
+            put("input", buildJsonArray {
+                add(JsonPrimitive("text"))
+                if (m.supports_images) add(JsonPrimitive("image"))
+            })
+            put("output", buildJsonArray { add(JsonPrimitive("text")) })
+        })
+        val limit = buildJsonObject {
+            if (m.context_length > 0) put("context", JsonPrimitive(m.context_length))
+            if (m.max_output_tokens > 0) put("output", JsonPrimitive(m.max_output_tokens))
+        }
+        if (limit.isNotEmpty()) put("limit", limit)
+        if (m.supports_tool_call) put("tool_call", JsonPrimitive(true))
+        if (m.supports_reasoning || m.supported_efforts.isNotEmpty()) put("reasoning", JsonPrimitive(true))
+        // "off"/"none"/"disabled" 是「关闭思考」而不是思考档：混进 effort 的 values
+        // 会被客户端当成「有个叫 off 的档位」，统一折成独立的 {"type":"toggle"}。
+        val offWords = setOf("off", "none", "disabled")
+        val levels = m.supported_efforts.filter { it.lowercase() !in offWords }
+        val canDisable = m.can_disable_thinking || m.supported_efforts.any { it.lowercase() in offWords }
+        if (levels.isNotEmpty() || canDisable) {
+            put("reasoning_options", buildJsonArray {
+                if (levels.isNotEmpty()) {
+                    add(buildJsonObject {
+                        put("type", JsonPrimitive("effort"))
+                        put("values", buildJsonArray { levels.forEach { add(JsonPrimitive(it)) } })
+                    })
+                }
+                if (canDisable) add(buildJsonObject { put("type", JsonPrimitive("toggle")) })
+            })
+            // magpie 的私有方言：它只读这个键（值须是 EffortRank 认识的小写词）。
+            put("supported_reasoning_levels", buildJsonArray {
+                if (canDisable) add(buildJsonObject { put("effort", JsonPrimitive("none")) })
+                levels.forEach { add(buildJsonObject { put("effort", JsonPrimitive(it)) }) }
+            })
         }
     }
 

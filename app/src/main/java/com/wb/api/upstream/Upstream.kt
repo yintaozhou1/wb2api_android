@@ -397,6 +397,9 @@ data class HttpResult(val code: Int, val text: String, val url: String) {
 }
 
 /** 上游客户端：基于 OkHttp（HTTP/1.1，连接层按上游实测加固）。 */
+/** 一路 `/v3/config` 探测结果：[models] 为目录条目，[pick] 为客户端菜单口径（缺失 = null）。 */
+private data class V3Page(val models: List<JsonObject>, val pick: ClientPick?)
+
 class UpstreamClient(
     private val userAgentOverride: String = "",
     timeoutSeconds: Long = 120,
@@ -935,10 +938,16 @@ class UpstreamClient(
      * 合并口径与上游一致：**按权威序**（各 /v3 路在前、企业端点在最后）去重，id 首次出现的
      * 条目为准（字段权威）。逐路容错：某一路失败只丢该路结果并记日志；全部为空才抛错
      * （不再回落任何静态名单 —— 与上游「纯动态、无兜底」的产品决策一致）。
+     *
+     * **可见性口径（1.7.1 起，对齐上游 clientpick.go）**：每路 /v3 结果先按该路自己的
+     * `data.agents[默认].models` 裁剪（去 auto/auto-chat、去 ModelRateLimitCap 的 paidId、
+     * 顶部补 fast/balanced/deep 三个速度预设）。CN 只认主路 + 企业端点；global 三路 UA
+     * 各按自己下发的 agents 裁剪后并集（客户端用哪族 UA 就显示那族菜单）。
      */
     suspend fun fetchModels(realm: String, auth: AuthEntry): List<JsonObject> = withContext(Dispatchers.IO) {
-        // 追加官方现有两种 UA 形态（三段式 + 两段式 Lite）作为**纯增量**探测路：
-        // 合并按 id 去重、只在多不在少，可兜住「旧 UA 被上游收紧后目录变空」。
+        // 官方现有两种 UA 形态（三段式 + 两段式 Lite）+ IDE 形态并发探测。
+        // **CN 只认第 0 路（官方桌面端 UA）的 picker 名单**（见下方 chosenRoutes）：
+        // 另外两路拿到的是同一份平台全量目录，只在主路口径缺失时作为兜底。
         val lite = Up.workBuddyUaLite(realm)
         val v3UAs = if (realm == "global") {
             listOf(Up.workBuddyUA(realm), lite, Up.UA_IDE, Up.UA_CLI)
@@ -951,31 +960,57 @@ class UpstreamClient(
             listOf(Up.P_MODELS_BIZ)
         }
 
-        val routes: List<Pair<String, List<JsonObject>>> = coroutineScope {
-            val v3Jobs = v3UAs.map { ua ->
+        // 每一路 v3 探测返回「模型表 + 客户端 picker 口径」（见 upstream/ClientPick.kt）。
+        // **合并前先按 picker 裁剪**：/v3/config 的 data.models 是平台全量目录，官方
+        // 客户端菜单只显示默认 agent 的 models（CN 实测 58 条目录 → 16 条菜单），
+        // 照单全列正是「列表里混进不可用 / 过时模型」的来源。
+        val routes: List<Pair<String, V3Page>> = coroutineScope {
+            val v3Jobs = v3UAs.mapIndexed { i, ua ->
                 async {
-                    val label = "v3:${ua.substringBefore('/')}"
+                    val label = "v3[$i]"
                     label to runCatching { fetchV3Config(realm, auth, ua) }.getOrElse { e ->
                         LogBus.log("[up] 模型路 $label 失败：${e.message}")
-                        emptyList()
+                        V3Page(emptyList(), null)
                     }
                 }
             }
             val bizJob = async {
-                "enterprise" to runCatching { fetchEnterpriseModels(realm, auth, enterprisePaths) }.getOrElse { e ->
-                    LogBus.log("[up] 模型路 enterprise 失败：${e.message}")
-                    emptyList()
-                }
+                "enterprise" to runCatching { V3Page(fetchEnterpriseModels(realm, auth, enterprisePaths), null) }
+                    .getOrElse { e ->
+                        LogBus.log("[up] 模型路 enterprise 失败：${e.message}")
+                        V3Page(emptyList(), null)
+                    }
             }
             (v3Jobs + bizJob).map { it.await() }
         }
 
+        // CN：主路（官方桌面端 UA）给出 picker 名单时只认它 + 企业端点补充——
+        // 与上游 CN「单路 /v3/config + 企业端点」同口径。主路口径缺失（上游没下发
+        // agents，老版本 / 私有化）时才回退多路，宁可全列也不臆造白名单。
+        val v3Routes = routes.filter { it.first != "enterprise" }
+        val bizRoutes = routes.filter { it.first == "enterprise" }
+        val chosenRoutes = if (realm == "cn" && v3Routes.firstOrNull()?.second?.pick != null) {
+            listOf(v3Routes.first()) + bizRoutes
+        } else {
+            routes
+        }
+
         val seen = HashSet<String>()
         val merged = ArrayList<JsonObject>()
-        for ((label, list) in routes) {
-            if (list.isEmpty()) continue
-            LogBus.log("[up] 模型路 $label -> ${list.size} 条")
-            for (o in list) {
+        for ((label, page) in chosenRoutes) {
+            val models = page.models
+            if (models.isEmpty()) continue
+            val byId = models.mapNotNull { o ->
+                val id = o["id"]?.primTextOrNull()?.removePrefix("cn:")?.removePrefix("global:")?.trim()
+                if (id.isNullOrEmpty()) null else id to o
+            }.toMap()
+            val ordered = page.pick?.ordered(byId)
+            val outList = if (ordered != null) ordered.mapNotNull { byId[it] } else models
+            LogBus.log(
+                "[up] 模型路 $label -> ${outList.size} 条" +
+                    if (ordered != null) "（picker 口径，目录 ${models.size} 条）" else "",
+            )
+            for (o in outList) {
                 val id = o["id"]?.primTextOrNull()
                     ?.removePrefix("cn:")?.removePrefix("global:").orEmpty().trim()
                 if (id.isEmpty() || !seen.add(id)) continue
@@ -997,12 +1032,15 @@ class UpstreamClient(
      * `X-Domain`（账号落盘 domain，缺省回落 chatBase host）与 `X-Product: SaaS`。
      * 不同 UA 下发的模型集合不同，故 global 侧要跑三路（见 [fetchModels]）。
      */
-    private fun fetchV3Config(realm: String, auth: AuthEntry, ua: String): List<JsonObject> {
+    private fun fetchV3Config(realm: String, auth: AuthEntry, ua: String): V3Page {
         var last = HttpResult(0, "", "")
         for (base in Up.chatBases(realm)) {
             val url = base + Up.P_MODELS_V3
             val b = Request.Builder().url(url).get()
             b.header("Accept", "application/json, text/plain, */*")
+            // 说明：上游 2026-10-30 抓包确认官方客户端 /v3/config **不发** X-Requested-With /
+            // X-CodeBuddy-Request（那是渲染器侧另一条镜像链）。本端保留这两个头是既已验证可用
+            // 的形态，且 picker 口径只依赖响应体 data.agents（与头无关）——为不引入回归暂不对齐。
             b.header("X-Requested-With", "XMLHttpRequest")
             b.header("Content-Type", "application/json")
             b.header("X-CodeBuddy-Request", "1")
@@ -1019,7 +1057,10 @@ class UpstreamClient(
             if (r.ok) {
                 val data = parseEnvelope(r.text)
                 val arr = (data["models"] ?: data["data"]) as? kotlinx.serialization.json.JsonArray
-                return arr?.mapNotNull { it as? JsonObject } ?: emptyList()
+                return V3Page(
+                    models = arr?.mapNotNull { it as? JsonObject } ?: emptyList(),
+                    pick = ClientPick.parse(data),
+                )
             }
             last = r
             if (r.code != 404) break
@@ -1073,6 +1114,8 @@ class UpstreamClient(
                     .orEmpty()
                 val out = ArrayList<JsonObject>(cliIds.size)
                 for (id in cliIds) {
+                    // auto / auto-chat 是客户端「自动模式」开关，不是菜单项（见 ClientPick）。
+                    if (id in ClientPick.AUTO_MODE_IDS) continue
                     val o = table[id] ?: continue
                     if (o["disabled"]?.primTextOrNull()?.toBoolean() == true) continue
                     out.add(o)
@@ -1144,9 +1187,15 @@ class UpstreamClient(
             val resp = try {
                 chatHttp.newCall(req).execute()
             } catch (e: Throwable) {
-                // 单 base 传输层异常（连接被拒 / TLS / 首字超时）→ 换下一个 base 再试，
-                // 而不是直接把失败当作「账号问题」去换号（换号解决不了 base 不可达）。
-                LogBus.log("[up] POST $url transport error: ${e.message} -> 尝试下一个 base")
+                // **只对「建连阶段」失败换下一个 base**：请求根本没送达上游，换域重发安全。
+                // 读超时 / 连接中途重置时 POST 已经发出、上游可能已在生成并计费，换 base 重发
+                // 等于同一轮对话打 2~3 次上游（用户看不到这次重发，账号也不会被记一次失败）。
+                // 这类失败交给上层「换号」语义处置。
+                val connectPhase = e is java.net.ConnectException ||
+                    e is java.net.UnknownHostException ||
+                    e is java.net.NoRouteToHostException
+                if (!connectPhase) throw e
+                LogBus.log("[up] POST $url connect error: ${e.message} -> 尝试下一个 base")
                 continue
             }
             LogBus.log("[up] POST $url -> http ${resp.code}")
@@ -1341,7 +1390,10 @@ class UpstreamClient(
 
     /**
      * 成长任务列表。对齐 Go `ListTasks`：`GET /v2/activity/growth/tasks`，响应体 `data.tasks[]`。
-     * 拉取失败返回空列表（调用方按「无任务」处理，不把网络问题伪装成任务为空）。
+     *
+     * **容错版**：失败返回空列表。只给「批量容错」路径用（acceptPendingAuth / 单动作回读）。
+     * 需要区分「没有任务」与「拉取失败」的扫描汇总请用 [growthTasksStrict] ——
+     * 否则 AccountResult.error 恒为 null、日志会把网络故障说成「活动已结束」。
      */
     suspend fun growthTasks(auth: AuthEntry): List<JsonObject> = withContext(Dispatchers.IO) {
         runCatching {
@@ -1351,6 +1403,29 @@ class UpstreamClient(
             val arr = (data["tasks"] ?: data["list"]) as? kotlinx.serialization.json.JsonArray
             arr?.mapNotNull { it as? JsonObject } ?: emptyList()
         }.getOrDefault(emptyList())
+    }
+
+    /** 成长任务列表（严格版）：HTTP/业务错误一律抛出，供扫描汇总区分「无任务」与「拉取失败」。 */
+    suspend fun growthTasksStrict(auth: AuthEntry): List<JsonObject> = withContext(Dispatchers.IO) {
+        val r = growthCall(auth, "GET", Up.P_GROWTH_TASKS)
+        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "tasks HTTP ${r.code} @ ${r.url}")
+        val data = parseEnvelope(r.text)
+        val arr = (data["tasks"] ?: data["list"]) as? kotlinx.serialization.json.JsonArray
+        arr?.mapNotNull { it as? JsonObject } ?: emptyList()
+    }
+
+    /** 默认口径 + mp 口径合并（严格版：默认口径失败即抛，mp 失败只丢 mp 结果）。 */
+    suspend fun growthTasksMergedStrict(auth: AuthEntry): List<JsonObject> {
+        val base = growthTasksStrict(auth)
+        // 去重键与 GrowthService.taskCode 同口径：global 列表用 code 字段（无 task_code）。
+        val seen = base.mapNotNull { it["task_code"]?.primTextOrNull() ?: it["code"]?.primTextOrNull() }.toHashSet()
+        val out = base.toMutableList()
+        val mp = runCatching { growthTasksMP(auth) }.getOrDefault(emptyList())
+        for (t in mp) {
+            val code = t["task_code"]?.primTextOrNull() ?: t["code"]?.primTextOrNull() ?: continue
+            if (seen.add(code)) out.add(t)
+        }
+        return out
     }
 
     /**
@@ -1445,11 +1520,12 @@ class UpstreamClient(
      */
     suspend fun growthTasksMerged(auth: AuthEntry): List<JsonObject> = withContext(Dispatchers.IO) {
         val base = growthTasks(auth)
-        val seen = base.mapNotNull { it["task_code"]?.primTextOrNull() }.toHashSet()
+        // 去重键与 GrowthService.taskCode 同口径：global 列表用 code 字段（无 task_code）。
+        val seen = base.mapNotNull { it["task_code"]?.primTextOrNull() ?: it["code"]?.primTextOrNull() }.toHashSet()
         val out = base.toMutableList()
         val mp = runCatching { growthTasksMP(auth) }.getOrDefault(emptyList())
         for (t in mp) {
-            val code = t["task_code"]?.primTextOrNull() ?: continue
+            val code = t["task_code"]?.primTextOrNull() ?: t["code"]?.primTextOrNull() ?: continue
             if (seen.add(code)) out.add(t)
         }
         out
@@ -1911,15 +1987,6 @@ object Classify {
     }
 
     /**
-     * 渠道校验拦截判据（`ErrKind.CHANNEL_BLOCK` 的唯一入口）。
-     *
-     * 判据**必须同时**要求「业务码命中」与「msg 属于渠道文案」：
-     *  - 只看 msg："request illegal" 也出现在 11140（账号级授权风控，必须硬禁用）；
-     *  - 只看 code：11128 也用于内容审核（`{"code":11128,"msg":"blocked by security policy"}`，
-     *    新上游 client_test 的 ErrContentBlocked 用例）—— 那属零动作，不该软冷却。
-     * 两者同时成立才是「渠道校验」。
-     */
-    /**
      * 14003 模型繁忙判据：结构化 code 主判，官方中文/英文文案兜底（上游 issue #46）。
      *
      * 只在 4xx/429 语境使用（见 [of] 的调用位置）；5xx 属服务端故障优先，不在此列。
@@ -1961,6 +2028,15 @@ object Classify {
         return n.coerceAtMost(3600.0).toLong()
     }
 
+    /**
+     * 渠道校验拦截判据（`ErrKind.CHANNEL_BLOCK` 的唯一入口）。
+     *
+     * 判据**必须同时**要求「业务码命中」与「msg 属于渠道文案」：
+     *  - 只看 msg："request illegal" 也出现在 11140（账号级授权风控，必须硬禁用）；
+     *  - 只看 code：11128 也用于内容审核（`{"code":11128,"msg":"blocked by security policy"}`，
+     *    新上游 client_test 的 ErrContentBlocked 用例）—— 那属零动作，不该软冷却。
+     * 两者同时成立才是「渠道校验」。
+     */
     fun isChannelBlock(body: String): Boolean {
         // 去掉反斜杠再判：SSE error 帧与网关 sendError 会把上游信封**再序列化一层**，
         // 于是 `"code":11128` 以 `\"code\":11128` 的形态出现（实测报文就是这样）。
