@@ -65,6 +65,7 @@ import com.wb.api.core.ScheduleCfg
 import com.wb.api.core.SessionStickyCfg
 import com.wb.api.core.UiCfg
 import com.wb.api.model.ModelInfo
+import com.wb.api.server.GrowthService
 import com.wb.api.pool.AccountView
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
@@ -1385,26 +1386,49 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                             onChange = { draft = draft.copy(schedule = draft.schedule.copy(balance_refresh_minutes = it)) },
                         )
                     }
+                }
+            }
+
+            // ---------- 成长任务（任务中心） ----------
+            item {
+                val growthReport by vm.growthReport.collectAsStateWithLifecycle()
+                val growthBusy by vm.growthBusy.collectAsStateWithLifecycle()
+                val growthProgress by vm.growthProgress.collectAsStateWithLifecycle()
+                val growthTasks by vm.growthTasks.collectAsStateWithLifecycle()
+                val growthTaskAccount by vm.growthTaskAccount.collectAsStateWithLifecycle()
+                val growthTasksBusy by vm.growthTasksBusy.collectAsStateWithLifecycle()
+                // 懒加载明细：进设置页先把当前账号的任务拉出来，而不是等用户点刷新。
+                // 失败（会话失效 / 网络）由 VM toast 说原因，这里只呈现空态。
+                LaunchedEffect(Unit) { if (growthTasks.isEmpty()) vm.loadGrowthTasks() }
+                WbGroup(
+                    title = "成长任务",
+                    subtitle = "报名 → 行为事件点亮进度 → 自动领奖（跳过禁用与 global 账号）",
+                    icon = MiuixIcons.Ok,
+                    // 固定展开：WbGroup 的 initiallyExpanded 只在首次组合生效，而首帧
+                    // growthTasks 必为空——若按「有数据才展开」，拉到数据也不会自动展开。
+                    initiallyExpanded = true,
+                ) {
+                    WbRow(
+                        label = "任务账号",
+                        value = if (growthTasksBusy) "正在拉取…" else growthTaskAccount.ifBlank { "未选择" },
+                        showDivider = true,
+                        onClick = { vm.loadGrowthTasks(force = true) },
+                    )
+                    if (growthTasks.isNotEmpty()) {
+                        growthTasks.forEachIndexed { i, t ->
+                            GrowthTaskRow(t, showDivider = i != growthTasks.lastIndex) {
+                                vm.claimGrowthTask(t.code)
+                            }
+                        }
+                    } else if (!growthTasksBusy) {
+                        WbEmpty("暂无任务明细 · 点上方「任务账号」刷新", icon = MiuixIcons.Tasks)
+                    }
                     Column(
                         Modifier.padding(WbD.gap),
                         verticalArrangement = Arrangement.spacedBy(WbD.gapS),
                     ) {
-                        // 成长任务：上游接口**已接入**（对齐 workbuddy2api-panel 的 tasks.go）。
-                        // 这里给出「扫描并领取」入口 + 实时进度 + 最近一次结果。
-                        val growthReport by vm.growthReport.collectAsStateWithLifecycle()
-                        val growthBusy by vm.growthBusy.collectAsStateWithLifecycle()
-                        val growthProgress by vm.growthProgress.collectAsStateWithLifecycle()
-                        WbHintBlock(
-                            // 注意：正文里**不要**写 Markdown 的粗体记号（两个星号）——
-                            // WbHintBlock 用的是纯 Text，星号会被原样显示出来。
-                            title = "成长任务（已接入上游）",
-                            body = "扫描全部账号的成长任务：自动报名（分片 + 回读验证）→ 经行为事件上报真实" +
-                                "推进进度 → 异步回读 → 自动领奖（走 Web 域正确路径）。行为事件按天幂等，" +
-                                "已达标 / 已领取自动跳过；跳过禁用与 global 账号。",
-                            icon = MiuixIcons.Ok,
-                        )
                         WbButton(
-                            text = if (growthBusy) "正在扫描…" else "扫描并领取成长任务",
+                            text = if (growthBusy) "正在扫描…" else "扫描全部账号并领取",
                             onClick = { vm.runGrowthTasks() },
                             modifier = Modifier.fillMaxWidth(),
                             variant = WbButtonVariant.Tonal,
@@ -1415,9 +1439,6 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                         if (growthBusy) {
                             // 扫描可能跑几十秒到几分钟（多账号 × 分片报名 + 事件上报 + 回读 + 领奖）：
                             // 给出「第几个账号 / 共几个」的实时文案 + 图标旋转，替换「点了没反应」的干等。
-                            //
-                            // 刻意不用不确定进度条：Miuix 的进度组件在各版本里签名不稳，
-                            // 而「逐账号文字 + 旋转图标」已足以说明「进行到哪、还剩几个」。
                             Text(
                                 growthProgress.ifBlank { "正在准备…" },
                                 style = MiuixTheme.textStyles.footnote1,
@@ -1425,7 +1446,7 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                             )
                         }
                         growthReport?.let { r ->
-                            // 汇总摘要**单独成行**：它很长（含各账号合计），塞进 WbRow 的右值位会挤成好几行。
+                            // 汇总摘要单独成行：它很长（含各账号合计），塞进 WbRow 的右值位会挤成好几行。
                             Column(
                                 Modifier.fillMaxWidth(),
                                 verticalArrangement = Arrangement.spacedBy(WbD.gapXs),
@@ -1452,11 +1473,11 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                             }
                         }
                         WbHintBlock(
-                            title = "仍未接入的上游任务",
-                            body = "猫猫旅行 / token 保活：上游对应接口尚未接入，" +
-                                "开关保留在配置中但不会执行（日志会注明「未接入」）。" +
-                                "夜猫子任务已随上游下架从排程中移除。" +
-                                "活跃上报与连登管家（兑换/抽奖/补签/礼包）已接入，跟随签到排程自动执行。",
+                            title = "为什么有的任务一直「进行中」",
+                            body = "需要真实对话的任务（Model_chat / skill / 专家链路 / 小程序 mini chat）" +
+                                "不做脚本化上报：上游按真人节奏与真实会话校验，数秒级连发会被整体回滚。" +
+                                "这类任务请直接在官方客户端完成；猫猫旅行与 token 保活尚未接入上游接口，" +
+                                "开关保留但不执行。",
                             icon = MiuixIcons.Info,
                         )
                     }
@@ -1619,5 +1640,79 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                 WbTextButton("取消", onClick = { confirmReset = false }, modifier = Modifier.fillMaxWidth())
             }
         }
+    }
+}
+
+/**
+ * 成长任务单行（任务中心）。
+ *
+ * 为什么不用 WbRow：一行里要同时放「标题 + 进度/奖励 + 状态胶囊/领取按钮」，
+ * 而 WbRow 的右值位只能放一段文本，塞进去会把标题挤成竖排（历史踩坑）。
+ * 这里自绘：左列标题 + 进度，右侧状态或领取按钮；分隔线由调用方控制最后一行不画。
+ */
+@Composable
+private fun GrowthTaskRow(
+    t: GrowthService.TaskView,
+    showDivider: Boolean,
+    onClaim: () -> Unit,
+) {
+    val statusColor = when {
+        t.claimed -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        t.claimable -> MiuixTheme.colorScheme.primary
+        t.locked -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        else -> MiuixTheme.colorScheme.onSurfaceVariantActions
+    }
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = WbD.rowPadH, vertical = WbD.rowPadV),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    t.title,
+                    style = MiuixTheme.textStyles.body1,
+                    color = MiuixTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val reward = buildString {
+                    if (t.credit > 0) append("+${t.credit} 积分")
+                    if (t.energy > 0) {
+                        if (isNotEmpty()) append(" · ")
+                        append("+${t.energy} 能量")
+                    }
+                }
+                Text(
+                    buildString {
+                        append("进度 ").append(t.progressText())
+                        if (reward.isNotEmpty()) append(" · ").append(reward)
+                        if (t.mpOnly) append(" · 小程序")
+                    },
+                    style = MiuixTheme.textStyles.footnote1,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            WbHSpace(WbD.gapS)
+            if (t.claimable) {
+                // 自绘小按钮：Miuix Button 自带最小高度，行内会把整行撑高、与左侧两行文字错位。
+                Text(
+                    "领取",
+                    style = MiuixTheme.textStyles.footnote1,
+                    color = MiuixTheme.colorScheme.onPrimary,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(MiuixTheme.colorScheme.primary)
+                        .clickable { onClaim() }
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                )
+            } else {
+                WbPill(t.statusText(), statusColor)
+            }
+        }
+        if (showDivider) WbHairline()
     }
 }

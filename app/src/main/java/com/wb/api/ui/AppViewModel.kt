@@ -392,6 +392,72 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _growthProgress = kotlinx.coroutines.flow.MutableStateFlow("")
     val growthProgress: kotlinx.coroutines.flow.StateFlow<String> = _growthProgress
 
+    /**
+     * 任务中心：当前账号的任务明细（只读展示 + 单条领取）。
+     *
+     * 旧 UI 只有「扫描并领取」一个黑盒按钮 + 一行汇总，看不到有哪些任务、进度到哪、
+     * 奖励多少、为什么没领到。明细本来就在 `growthTasksMerged` 的响应里，补上映射即可。
+     */
+    private val _growthTasks = MutableStateFlow<List<GrowthService.TaskView>>(emptyList())
+    val growthTasks: StateFlow<List<GrowthService.TaskView>> = _growthTasks
+    private val _growthTaskAccount = MutableStateFlow("")
+    val growthTaskAccount: StateFlow<String> = _growthTaskAccount
+    private val _growthTasksBusy = MutableStateFlow(false)
+    val growthTasksBusy: StateFlow<Boolean> = _growthTasksBusy
+    private var growthTaskUid: String? = null
+    /** 惰性加载的一次性标记：设置页 item 滚出视口再滚回来会重跑 LaunchedEffect。 */
+    private var growthTasksTried = false
+
+    /**
+     * 加载 / 刷新任务明细（取第一个门控账号；无可用账号则清空并提示）。
+     *
+     * @param force 用户主动点「任务账号」行时传 true；页面首次进入用 false（不重复打网络）。
+     */
+    fun loadGrowthTasks(force: Boolean = false) {
+        if (_growthTasksBusy.value) return
+        if (!force && growthTasksTried) return
+        growthTasksTried = true
+        viewModelScope.launch {
+            val acc = GrowthService.gatedAccounts().firstOrNull()
+            if (acc == null) {
+                growthTaskUid = null
+                _growthTasks.value = emptyList()
+                _growthTaskAccount.value = ""
+                toast("没有可查询的账号（已跳过禁用与 global 账号）")
+                return@launch
+            }
+            _growthTasksBusy.value = true
+            growthTaskUid = acc.uid
+            _growthTaskAccount.value = acc.nickname.ifBlank { acc.uid.take(8) }
+            val list = runCatching {
+                withContext(Dispatchers.IO) { GrowthService.tasks(acc) }
+            }.getOrElse { e ->
+                toast("任务列表拉取失败：${e.message ?: e.javaClass.simpleName}")
+                emptyList()
+            }
+            _growthTasks.value = list
+            _growthTasksBusy.value = false
+        }
+    }
+
+    /** 单条领取（任务中心「领取」按钮）：先本地校验可领，成功后刷新明细。 */
+    fun claimGrowthTask(code: String) {
+        val uid = growthTaskUid ?: return
+        viewModelScope.launch {
+            val acc = Gateway.store.auths().firstOrNull { it.uid == uid } ?: return@launch
+            runCatching {
+                withContext(Dispatchers.IO) { GrowthService.claimOne(acc, code) }
+            }.onSuccess { (c, e) ->
+                toast(
+                    if (c > 0 || e > 0) "已领取 +$c 积分" + (if (e > 0) " +$e 能量" else "")
+                    // (0,0) 是上游「此前已领取」的幂等成功，不等于「本次没领到」。
+                    else "领奖接口已确认（奖励此前可能已领取）",
+                )
+                loadGrowthTasks(force = true)
+            }.onFailure { toast(it.message ?: "领取失败") }
+        }
+    }
+
     fun runGrowthTasks() {
         if (_growthBusy.value) return
         viewModelScope.launch {

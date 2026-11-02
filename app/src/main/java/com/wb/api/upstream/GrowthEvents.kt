@@ -155,18 +155,3 @@ fun desktopPlaybookPromptSequence(conversationId: String, requestId: String, cas
     return events
 }
 
-/** 「设计创意画布」事件组（对齐 Go DesktopDesignCanvasSequence，desktop.go:354-367）。 */
-fun desktopDesignCanvasSequence(conversationId: String, requestId: String): List<JsonObject> {
-    val events = desktopChatSequence(conversationId, requestId, "msg-canvas", "fast-model", "fast-model").toMutableList()
-    val tail = if (requestId.length >= 8) requestId.substring(requestId.length - 8) else requestId
-    events.add(jsonOf(
-        "eventCode" to "wbx_design_canvas_task_create", "conversationId" to conversationId,
-        "requestId" to requestId, "source" to "summon_keyword", "cost" to 12000, "isSuccessful" to true,
-    ))
-    events.add(jsonOf(
-        "eventCode" to "wbx_design_canvas_open", "conversationId" to conversationId,
-        "requestId" to requestId, "id" to "ardot-file-$tail",
-        "source" to "summon_keyword", "type" to "page", "cost" to 13000, "isSuccessful" to true,
-    ))
-    return events
-}

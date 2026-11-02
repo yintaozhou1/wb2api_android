@@ -5,7 +5,6 @@ import com.wb.api.model.AuthEntry
 import com.wb.api.upstream.desktopAutomationCreateEvent
 import com.wb.api.upstream.desktopBuddyAppSequence
 import com.wb.api.upstream.desktopChatSequence
-import com.wb.api.upstream.desktopDesignCanvasSequence
 import com.wb.api.upstream.desktopPlaybookPromptSequence
 import com.wb.api.upstream.desktopTemplateUseSequence
 import com.wb.api.upstream.jsonOf
@@ -19,7 +18,8 @@ import kotlinx.coroutines.delay
  *
  * 移植范围（对齐 spec §5.2）：只登记**零真实对话、纯行为事件上报**即可完成的任务，
  * 即 CLI/billing /v2/report（chat_5、first_buddy）+ 桌面指纹（RichMeow/Buddy_App/
- * automation_1/template_5/playbook_prompt/create_canvas/Hp_Appearance）+ web 指纹（Library_read）。
+ * automation_1/template_5/playbook_prompt/Hp_Appearance）+ web 指纹（Library_read）。
+ * 上游已下架并删除动作代码：Model_chat_GLM5.2 / Buddy_App_QQ / create_canvas / black_cat。
  *
  * **未登记**（需真实对话 / 小程序 / 专家链路，属增量）：
  *  - `Model_chat_GLM5.2` / `black_cat` / `skill_1` / `Expert_lighthouse`：需 glm-5.2 或 fast-model
@@ -52,12 +52,10 @@ object GrowthActions {
         GrowthAction("first_buddy", "上报解锁 → 同意协议 → 领取第一只 Buddy（+300 分）") { a -> runFirstBuddy(a) },
         GrowthAction("RichMeow_Chat", "桌面指纹对话事件链上报（workbuddy-desktop）") { a -> runRichMeow(a) },
         GrowthAction("Buddy_App", "上报「进入 Buddy 应用」事件链") { a -> runBuddyApp(a) },
-        GrowthAction("Buddy_App_QQ", "上报「进入企鹅教师助手」事件链（与 Buddy_App 共用）") { a -> runBuddyApp(a) },
         GrowthAction("automation_1", "上报「定时任务创建」事件（automated_task_create_suc）") { a -> runAutomationCreate(a) },
         GrowthAction("Library_read", "上报「读资料库介绍」事件（web 指纹）") { a -> runLibraryRead(a) },
         GrowthAction("template_5", "上报「使用模板创建任务」事件组 ×5") { a -> runTemplateUse(a) },
         GrowthAction("playbook_prompt", "上报「灵感案例做同款发送 Prompt」事件组") { a -> runPlaybookPrompt(a) },
-        GrowthAction("create_canvas", "上报「设计创意画布创建」事件组（+300 分）") { a -> runCreateCanvas(a) },
         GrowthAction("Hp_Appearance", "设置主题 API + 皮肤生效事件") { a -> runAppearance(a) },
     )
 
@@ -144,13 +142,6 @@ object GrowthActions {
             a, desktopPlaybookPromptSequence("wb2api-pb-$ms", "wb2api-pb-req-$ms", "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸"),
         )
         return "已上报 playbook_cta_click + playbook_prompt_send"
-    }
-
-    /** 设计创意画布创建（对齐 runCreateCanvas，autotask.go:1039-1048）。 */
-    private suspend fun runCreateCanvas(a: AuthEntry): String {
-        val ms = System.currentTimeMillis()
-        Gateway.upstream.reportDesktopEvent(a, desktopDesignCanvasSequence("wb2api-canvas-$ms", "wb2api-canvas-req-$ms"))
-        return "已上报 wbx_design_canvas_task_create/open"
     }
 
     /** 换主题：set API 留痕 + appearance_skin_apply 事件（对齐 runAppearance，autotask.go:991-1004）。 */
