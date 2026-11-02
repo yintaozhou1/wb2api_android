@@ -23,6 +23,20 @@ import java.util.concurrent.TimeUnit
  */
 object UpdateCheck {
 
+    /**
+     * 独立的长期 client：每次检查都新建 OkHttpClient 会连带新建连接池与 Dispatcher
+     * 线程池，闲置约 60s 才回收（冷启动 + 手动检查各一次 = 两套线程）。
+     * 单例复用即可 —— 超时参数与网关主 client 完全不同，不会互相影响。
+     */
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(12, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+
     /** 版本公告页（微云分享）。文本形如「最新版1.6.9https://…群号…」，用户会远程改成新版本。 */
     const val SOURCE_URL = "https://sharechain.qq.com/42e2768703ac7fd23d461423fa493198"
 
@@ -78,12 +92,6 @@ object UpdateCheck {
      * 连接池产生任何影响。
      */
     suspend fun fetch(): Result = withContext(Dispatchers.IO) {
-        val client = OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(8, TimeUnit.SECONDS)
-            .callTimeout(12, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
-            .build()
         val req = Request.Builder()
             .url(SOURCE_URL)
             // 用浏览器 UA：分享页是普通 Web 页面，个别 CDN 对非浏览器 UA 直接拒（403/挑战页）。

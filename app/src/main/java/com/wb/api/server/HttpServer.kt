@@ -560,9 +560,11 @@ class Router {
             put("total", JsonPrimitive(counts.total))
             put("service", JsonPrimitive("workbuddy2api"))
             put("running", JsonPrimitive(Gateway.isRunning()))
+            // 与 servableNow 同源判据（冷却中但仍可被 pick 兜底也算可服务），
+            // 不能用 healthy>0 —— 否则全池冷却时顶层 200 而分域 false，监控误报。
             put("realm_servable", buildJsonObject {
-                put("cn", JsonPrimitive(Gateway.pool.countsByRealm("cn").healthy > 0))
-                put("global", JsonPrimitive(Gateway.pool.countsByRealm("global").healthy > 0))
+                put("cn", JsonPrimitive(Gateway.pool.servableNowInRealm("cn")))
+                put("global", JsonPrimitive(Gateway.pool.servableNowInRealm("global")))
             })
         }
         res.sendJson(healthy, obj, mapOf("X-Service" to "workbuddy2api"))

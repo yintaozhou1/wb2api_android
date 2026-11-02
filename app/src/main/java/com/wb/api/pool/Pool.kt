@@ -705,7 +705,9 @@ class AccountPool(
                 earliest_remaining = if (earliestAt > 0) earliestRemaining else s.earliest_remaining,
             ),
         )
-        store.saveState(sticky)
+        // 余额刷新是「每账号一次」的批量路径：整份 state.json 逐号落盘 = N 次全量序列化 +
+        // 原子替换（含 fsync）。走节流（1s 合并一次），由 Scheduler.flush 兜底补写。
+        persistThrottled()
     }
 
     /** 记录签到时刻（「今日是否已签到」判定 / 自动补签的依据）。 */
@@ -765,6 +767,23 @@ class AccountPool(
         return store.auths().any { a ->
             val s = store.stateOf(a.uid)
             !s.disabled && !s.paused && !(s.cool_kind == "hard_credit" && s.cool_until > t)
+        }
+    }
+
+    /**
+     * 该域当前是否可服务（与 [servableNow] 同口径，只按 realm 过滤）。
+     *
+     * `/healthz` 的 realm_servable 曾用 `countsByRealm().healthy > 0`：全部号处于冷却时
+     * 顶层 healthy=200 而 realm_servable=false —— 监控按域误判不可用，与 servableNow
+     * 「冷却中但 pick 仍能兜底」的既有结论自相矛盾。
+     */
+    fun servableNowInRealm(realm: String): Boolean {
+        val t = now()
+        return store.auths().any { a ->
+            a.realm == realm && run {
+                val s = store.stateOf(a.uid)
+                !s.disabled && !s.paused && !(s.cool_kind == "hard_credit" && s.cool_until > t)
+            }
         }
     }
 

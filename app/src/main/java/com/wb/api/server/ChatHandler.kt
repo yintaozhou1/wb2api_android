@@ -199,7 +199,6 @@ object ChatHandler {
         Gateway.noteRequestStart()
 
         var lastKind = ErrKind.NONE
-        var lastStatus = 503
         var lastBody = ""
         var hop = Hop(ok = false)
         val tried = HashSet<String>()
@@ -262,7 +261,7 @@ object ChatHandler {
                         runBlocking { Gateway.upstream.chat(live, outbound, req.clientIp, conv) }
                     } catch (e: Throwable) {
                         val why = e.message ?: e.javaClass.simpleName
-                        lastKind = ErrKind.SERVER; lastStatus = 502
+                        lastKind = ErrKind.SERVER
                         lastBody = "upstream transport error: $why"
                         // 传输层失败只换号、不喂熔断（对齐 Go 网络抖动分支）：改喂连败降权，
                         // 否则上游网络一抖就会把健康账号熔断。
@@ -281,12 +280,15 @@ object ChatHandler {
                         } catch (e: UpstreamException) {
                             LogBus.log("$realm|$model responder 异常 uid=${auth.uid.take(8)} kind=${e.kind}: ${e.message}")
                             Gateway.pool.onTransportFailure(auth.uid, model, e.message ?: "responder")
-                            Hop(ok = false, sent = false, errKind = e.kind, errStatus = e.status, errBody = e.body)
+                            // sent 必须取实际状态：responses 流式在读到首帧前就 beginStream，
+                            // 写死 false 会让 runPipeline 判成「首帧前失败」而换号重发——同一轮
+                            // 对话打两次上游（真实计费），第二次的事件还写进同一条已开流。
+                            Hop(ok = false, sent = res.isStreaming, errKind = e.kind, errStatus = e.status, errBody = e.body)
                         } catch (e: Throwable) {
                             if (e is kotlinx.coroutines.CancellationException) throw e
                             LogBus.log("$realm|$model responder 异常 uid=${auth.uid.take(8)}: ${e.javaClass.simpleName} ${e.message}")
                             Gateway.pool.onTransportFailure(auth.uid, model, e.message ?: e.javaClass.simpleName)
-                            Hop(ok = false, sent = false,
+                            Hop(ok = false, sent = res.isStreaming,
                                 errKind = ErrKind.SERVER, errStatus = 502,
                                 errBody = "responder: ${e.message ?: e.javaClass.simpleName}")
                         }
@@ -301,6 +303,10 @@ object ChatHandler {
                         // 这次尝试对客户端无痕，换号重试（SSE 发过字节后无法改状态码，故仅 sent=false 生效）。
                         if (hop.sent) {
                             // 已发过 2xx 头（流式中途断掉）：HTTP 层确实成功过，但业务失败。
+                            // ⚠️ 必须补 chunked 终止块：半截流（没有 "0\r\n\r\n"）留在
+                            // keep-alive 连接上，下一条响应会被客户端当成上一条流的延续
+                            // （表现为「响应解析失败 / 串包」，且该连接必然被复用）。
+                            runCatching { res.endStream() }
                             httpOk = true
                             Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                             return
@@ -309,7 +315,6 @@ object ChatHandler {
                         // 通用 503 no_healthy_account（首帧 6004/11128 的语义会全丢）。
                         if (hop.errKind != ErrKind.NONE) {
                             lastKind = hop.errKind
-                            lastStatus = hop.errStatus
                             lastBody = hop.errBody
                         }
                         LogBus.log("$realm|$model uid=${auth.uid.take(8)} 首帧前失败 -> 换号重试")
@@ -322,7 +327,7 @@ object ChatHandler {
                         val text = resp.body?.string().orEmpty()
                         val retryAfter = resp.header("Retry-After")?.trim()?.toLongOrNull() ?: 0L
                         val kind = Classify.of(resp.code, text)
-                        lastKind = kind; lastStatus = resp.code; lastBody = text
+                        lastKind = kind; lastBody = text
                         noteError(auth, kind, resp.code, model, text, retryAfter)
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                         LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
@@ -594,7 +599,6 @@ object ChatHandler {
         // （速率 = 输出 tokens / (端到端 − TTFB)，见 Pool.tokensPerSecond 的注释）。
         var ttfbMs = 0L
         var firstId: String? = null
-        var frames = 0
         var errFrame: String? = null
         var usage = Tokens()
         var sawDone = false
@@ -648,7 +652,6 @@ object ChatHandler {
             markupCalls += calls.size
             val delta = buildJsonObject { put("tool_calls", Dsml.streamToolCalls(calls, base)) }
             res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), streamChunk(delta, null))}\n\n")
-            frames++
             LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} DSML 还原 ${calls.size} 个调用：${calls.joinToString { it.name }}")
         }
 
@@ -660,7 +663,18 @@ object ChatHandler {
                 val line = try {
                     reader.readLine()
                 } catch (e: Throwable) {
-                    if (!started) return Hop(ok = false, sent = false)
+                    if (!started) {
+                        // 首帧前断流：对客户端无痕，但**必须把失败留给轮转语义**。原来这里
+                        // errKind 缺省（NONE）→ runPipeline 不记 lastKind、也不罚号：终态报成
+                        // 503 no_healthy_account（真实原因是上游断流），而「每次都空流」的坏号
+                        // 永远不会被降权，会被反复选中。按传输失败处置（连败降权，不喂熔断）。
+                        Gateway.pool.onTransportFailure(auth.uid, model, e.message ?: e.javaClass.simpleName)
+                        return Hop(
+                            ok = false, sent = false,
+                            errKind = ErrKind.SERVER, errStatus = 502,
+                            errBody = "upstream stream aborted before first frame: ${e.message ?: e.javaClass.simpleName}",
+                        )
+                    }
                     LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游流中断（已开流）: ${e.message}")
                     break
                 } ?: break
@@ -697,7 +711,7 @@ object ChatHandler {
                 }
                 if (isErr) {
                     errFrame = effectivePayload
-                    res.chunk("data: $effectivePayload\n\n"); frames++
+                    res.chunk("data: $effectivePayload\n\n")
                     continue
                 }
                 usage = usage.merge(el)
@@ -726,7 +740,6 @@ object ChatHandler {
                 // finish_reason 先扣住：若后面还还原出调用，要改写成 tool_calls 再下发。
                 val forwarded = if (ch?.get("finish_reason") != null) stripFinishReason(norm.second) else norm.second
                 res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), forwarded)}\n\n")
-                frames++
             }
             if (!started) {
                 // 整个流没有任何 data 帧（上游空流 / 首帧前断开）→ 无痕，换号重试
@@ -743,7 +756,6 @@ object ChatHandler {
                     val norm = normalizeFrame(contentFrame(tail), firstId, seenToolNames)
                     firstId = norm.first
                     res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), norm.second)}\n\n")
-                    frames++
                 }
                 // 终态 finish_reason：还原出调用 → tool_calls；否则沿用上游给的；
                 // 两者都没有（既无 finish_reason 也无 [DONE]）= 断流 → length，
@@ -759,7 +771,6 @@ object ChatHandler {
                     LogBus.log("INFO| # $realm/$model uid=${auth.uid.take(8)} 静默回合：声明 ${allowedTools.size} 个 tools 但零 tool_calls + stop（模型选择直接回答，属正常收尾）")
                 }
                 res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), streamChunk(null, finalFinish))}\n\n")
-                frames++
             }
             if (!sawDone) {
                 LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游未发 [DONE]（EOF 收尾）→ 网关兜底补发")
@@ -831,7 +842,15 @@ object ChatHandler {
         val reader = BufferedReader(InputStreamReader(bodyStreamOf(resp)))
         try {
             while (true) {
-                val line = reader.readLine() ?: break
+                    // 读失败不能冒泡：responses 路径在读到首帧前就已 beginStream，异常逸出会被
+                    // runPipeline 当成「首帧前失败」换号重发——同一轮对话打两次上游（真实计费），
+                    // 第二次的事件还写进同一条已开流。这里按「断流」处理，走下方 incomplete 收尾。
+                    val line = try {
+                        reader.readLine()
+                    } catch (e: Throwable) {
+                        LogBus.log("| # $realm/$model responses 上游流中断: ${e.message}")
+                        null
+                    } ?: break
                 if (!line.startsWith("data:")) continue
                 val payload = line.substring(5).trim()
                 if (payload == "[DONE]") { sawDone = true; break }
@@ -1306,7 +1325,6 @@ object ChatHandler {
         data class Converted(
             val chat: JsonObject,
             val effort: String,
-            val toolsPresent: Boolean,
             /** 要原样回显进响应对象的请求侧字段（透传证据：客户端据此确认参数被接受）。 */
             val echo: JsonObject = JsonObject(emptyMap()),
             /** 非 null ⇒ 该请求本网关无法支持，直接以此文本 400 终止（不要静默丢弃）。 */
@@ -1356,7 +1374,7 @@ object ChatHandler {
             // 需要「服务端状态」的形态本网关给不了（无状态网关），必须显式拒绝而不是假装在跑。
             if (raw["background"]?.primText()?.toBoolean() == true) {
                 return Converted(
-                    buildJsonObject { put("model", JsonPrimitive(raw.str("model"))) }, effort, tools != null,
+                    buildJsonObject { put("model", JsonPrimitive(raw.str("model"))) }, effort,
                     reject = "this gateway does not support `background: true` (no server-side job store); " +
                         "please use stream=true with a persistent connection.",
                 )
@@ -1416,7 +1434,7 @@ object ChatHandler {
             val echo = buildJsonObject {
                 for (k in ECHO_KEYS) raw[k]?.let { if (it !is JsonNull) put(k, it) }
             }
-            return Converted(chat, effort, tools != null, echo)
+            return Converted(chat, effort, echo = echo)
         }
 
         /** 会话标识：`previous_response_id` 与 `conversation`（字符串或对象形态）都接。 */
