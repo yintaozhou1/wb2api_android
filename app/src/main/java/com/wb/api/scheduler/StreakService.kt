@@ -18,7 +18,8 @@ import java.util.Locale
  *
  * 闭环顺序（对齐 scheduler/streak.go:36-88）：
  *  ① 补签保连登（昨日漏签且有补签卡 → 用卡补上）；
- *  ② 领新手礼包（ClaimGift）→ 领活动补偿（ClaimCompensation），每号一次，无则静默；
+ *  ② 领新手礼包（ClaimGift），每号一次，无则静默；
+ *     （活动补偿 ClaimCompensation 的上游端点已下线，不再调用）
  *  ③ 查连登完整状态 → 遍历档位（7d/14d/28d），`status != locked && != claimed` 才**兑换**；
  *  ④ 查抽奖次数 → **有次数全部抽完**，奖品记日志。
  *
@@ -35,12 +36,14 @@ object StreakService {
         if (accounts.isEmpty()) return
         var done = 0
         for (a in accounts) {
-            if (runCatching { runOne(a) }.isSuccess) done++
+            // runOne 返回 Boolean：拉取失败走的是正常 return，用 isSuccess 计会把失败算成成功。
+            if (runCatching { runOne(a) }.getOrDefault(false)) done++
         }
         LogBus.log("[连登] 管家完成 $done/${accounts.size} 个账号")
     }
 
-    private suspend fun runOne(a: AuthEntry) {
+    /** @return 是否成功拿到连登状态（拉取失败返回 false，供汇总如实计数）。 */
+    private suspend fun runOne(a: AuthEntry): Boolean {
         val tag = a.uid.take(8)
         // ① 补签保连登
         makeupYesterday(a, tag)
@@ -51,7 +54,7 @@ object StreakService {
 
         // ③ 兑换所有已解锁档位
         val full = Gateway.upstream.growthStreakStatus(a)
-        if (full == null) { LogBus.log("streak-bonus $tag: 连登状态拉取失败"); return }
+        if (full == null) { LogBus.log("streak-bonus $tag: 连登状态拉取失败"); return false }
         val rs = full["redemption_status"]?.objOrNull()
         val statuses = mapOf(
             "7d" to (rs?.get("tier_7d_status")?.primTextOrNull() ?: ""),
@@ -75,12 +78,13 @@ object StreakService {
 
         // ④ 抽完所有 chances
         val chances = Gateway.upstream.lotteryChances(a)
-        if (chances <= 0) return
+        if (chances <= 0) return true
         for (i in 0 until chances) {
             val prize = Gateway.upstream.lotteryDraw(a) ?: break
             LogBus.log("streak-bonus $tag: 🎲 第${i + 1}抽 ${prize.take(220)}")
         }
         LogBus.log("streak-bonus $tag: 抽奖完成 $chances 次")
+        return true
     }
 
     /** 昨日漏签且有补签卡 → 用卡补签（blackcat.go:98-126 + scheduler/streak.go:101-116）。 */

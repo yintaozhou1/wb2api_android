@@ -263,7 +263,7 @@ class Store(private val context: Context) {
     //
     // 性能与稳定性（本次重构）：
     //  1. 原实现**每行** `appendText`（open → write → close 三次系统调用），高频请求下 syscall 开销可观；
-    //     现在常驻一个 8KB BufferedWriter，按「累计 8 行 或 距上次 flush 超过 1s」批量落盘。
+    //     现在常驻一个 8KB BufferedWriter，按「累计 8 行 或 距上次 flush 超过 1s」批量落盘（1s 条件在**下一次写入**时判定，没有独立定时器；低流量下最多滞留 7 行，直到下一次写入 / 读取 / 停止时落盘）。
     //  2. 原实现超限裁剪时 `readLines()` 把整个文件读成 `List<String>`——上限 100MB 时
     //     峰值堆占用可达数百 MB（每个 String 还有对象头），是明确的 OOM/GC 抖动源；
     //     现在改为**按字节定位 + 流式拷贝**到临时文件再改名，内存占用与文件大小无关。

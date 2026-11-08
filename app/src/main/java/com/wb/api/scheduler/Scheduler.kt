@@ -41,7 +41,6 @@ object Scheduler {
             // ⚠️ 这里**必须**接住异常并记日志：tick() 内部要跑签到 / 成长任务 / 余额刷新等
             // 多段上游调用，任何一处抛出未被捕获的异常，都会让这个 while(true) 协程**永久退出**
             // —— 症状是「所有定时任务静默停摆，且日志里什么都没有」，极难排查。
-            // （本文件其它 runCatching 都带了 onFailure，此前只有主循环这两处漏掉。）
             runCatching { tick(first = true) }
                 .onFailure { LogBus.log("[sys] scheduler tick 异常（首轮）：${it.message}") }
             while (true) {
@@ -100,7 +99,8 @@ object Scheduler {
         }
 
         // 定时任务区。**成长任务 / 活跃上报 / 连登管家均已接入真实上游接口**（1.5.1~1.5.2 完成）；
-        // 仍未接入的只有猫猫旅行（夜猫子任务已随上游下架移除）—— 如实记为「未实现」，绝不伪装成功。
+        // 仍未接入的是猫猫旅行与 token 保活（夜猫子任务已随上游下架移除）—— 如实记为
+        // 「未实现」，绝不伪装成功。
         if (s.growth_enabled && hour in s.growth_hours) once("growth", hour) {
             // `once` 的 block 不是挂起上下文 —— 与「补签巡检」同样处理：就地 runBlocking。
             // 该分支跑在 Scheduler 的 IO 调度协程里，阻塞的是调度线程而不是主线程。
@@ -167,9 +167,12 @@ object Scheduler {
     private fun once(name: String, hour: Int, block: () -> Unit) {
         val key = "$name-${dayFmt()}-$hour"
         if (ranToday.containsKey(key)) return
+        // 先登记再执行：block 抛异常时也不该在同一小时内反复重试（上游动作多为幂等，
+        // 但重试会把日志刷满、并发窗口内还可能重复上报）。
         ranToday[key] = "1"
         LogBus.log("$name triggered at $hour:00")
-        runCatching { block() }
+        // 必须记失败：否则日志里只剩「triggered」，看起来「跑了但没结果」。
+        runCatching { block() }.onFailure { LogBus.log("[sys] $name 执行失败：${it.message}") }
     }
 
     /** 签到单个账号，并**记下签到时刻**（供「未签到自动补签」判定）。 */

@@ -689,31 +689,38 @@ class AccountPool(
      * @param earliestRemaining 该批次的剩余量之和。
      */
     fun setCredits(uid: String, credits: Double, earliestAt: Long = 0, earliestRemaining: Double = 0.0) {
-        val s = store.stateOf(uid)
         // 会话积分消耗：与该账号上次观测值比较，下降量计入「本次运行消耗」。
         val seen = sessionCreditSeen.put(uid, credits)
         if (seen != null) {
             val drop = seen - credits
             if (drop > 0) sessionCreditConsumed += drop
         }
-        store.putState(
-            s.copy(
-                credits = credits,
-                credits_total = maxOf(s.credits_total, credits),
-                last_balance_at = now(),
-                earliest_at = if (earliestAt > 0) earliestAt else s.earliest_at,
-                earliest_remaining = if (earliestAt > 0) earliestRemaining else s.earliest_remaining,
-            ),
-        )
-        // 余额刷新是「每账号一次」的批量路径：整份 state.json 逐号落盘 = N 次全量序列化 +
-        // 原子替换（含 fsync）。走节流（1s 合并一次），由 Scheduler.flush 兜底补写。
+        // 读-改-写必须在同一临界区：否则请求线程刚写入的 cool_until 会被这里的旧快照覆盖，
+        // 冷却被静默抹掉（Store.withStateLock 的契约要求所有写路径都进来）。
+        store.withStateLock {
+            val s = store.stateOf(uid)
+            store.putState(
+                s.copy(
+                    credits = credits,
+                    credits_total = maxOf(s.credits_total, credits),
+                    last_balance_at = now(),
+                    earliest_at = if (earliestAt > 0) earliestAt else s.earliest_at,
+                    earliest_remaining = if (earliestAt > 0) earliestRemaining else s.earliest_remaining,
+                ),
+            )
+        }
+        // 落盘必须在临界区**之外**：persistThrottled 是 Pool 的 @Synchronized，而
+        // Pool.flush 是「持 Pool 锁 → 调 store.saveState」，在 Store 锁内反向取 Pool 锁会 AB-BA。
+        // 余额刷新是「每账号一次」的批量路径，走节流（1s 合并一次），由 Scheduler.flush 兜底。
         persistThrottled()
     }
 
     /** 记录签到时刻（「今日是否已签到」判定 / 自动补签的依据）。 */
     fun markCheckin(uid: String) {
-        val s = store.stateOf(uid)
-        store.putState(s.copy(last_checkin_at = now()))
+        // 同 setCredits：读-改-写进临界区，落盘放外面（saveState 会全量序列化，锁内代价高）。
+        store.withStateLock {
+            store.putState(store.stateOf(uid).copy(last_checkin_at = now()))
+        }
         store.saveState(sticky)
     }
 

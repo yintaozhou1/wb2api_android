@@ -82,7 +82,9 @@ object PanelApi {
     }
 
     private fun logs(res: Res) {
-        val entries = LogBus.snapshot()
+        // snapshotNow 取的是当前缓冲（snapshot 可能落后 120ms 的合并窗口）：
+        // 面板刷新后应立刻看到刚才那条日志。
+        val entries = LogBus.snapshotNow()
         val obj = buildJsonObject {
             put("entries", buildJsonArray {
                 entries.forEach { e ->
@@ -100,7 +102,8 @@ object PanelApi {
     private fun requestMetrics(res: Res) = res.sendJson(200, metricsJson())
 
     private fun requestLogs(req: Req, res: Res) {
-        val limit = req.query["limit"]?.toIntOrNull() ?: 200
+        // 上限裁剪：归档可能有几十 MB，客户端传个超大值会把它整份读进内存。
+        val limit = (req.query["limit"]?.toIntOrNull() ?: 200).coerceIn(1, 5000)
         val lines = Gateway.store.readRequestLogs(limit)
         val obj = buildJsonObject {
             put("entries", buildJsonArray {
@@ -335,6 +338,7 @@ object PanelApi {
             res.sendError(501, "operation '$op' is not implemented by this client", "not_implemented")
             return
         }
+        var okCount = 0
         val results = buildJsonArray {
             accounts.forEach { a ->
                 val r = runCatching {
@@ -353,10 +357,20 @@ object PanelApi {
                                 Gateway.pool.setCredits(a.uid, b.remain, b.earliestAt, b.earliestRemaining)
                                 "ok"
                             }
-                            else -> { Gateway.upstream.report(a, buildJsonObject { put("events", buildJsonArray {}) }.toString()); "ok" }
+                            // 活动上报：**不能**发空 events 数组。上游 report 的硬性约束是
+                            // 「事件体必含 userId 与事件」（report.go），空数组回 200 但静默丢弃，
+                            // 而面板会对每个号报 ok:true（用户点完以为成功，实际什么都没发）。
+                            // 与定时任务走同一条真实事件：chat_request_send。
+                            "activity" -> {
+                                val cid = "wb2api-panel-${System.currentTimeMillis()}-${a.uid.take(8)}"
+                                Gateway.upstream.reportChatActivity(a, cid, "")
+                                "ok"
+                            }
+                            else -> throw IllegalStateException("unknown op: $op")
                         }
                     }
                 }
+                if (r.isSuccess) okCount++
                 add(buildJsonObject {
                     put("uid", JsonPrimitive(a.uid))
                     put("nickname", JsonPrimitive(a.nickname))
@@ -365,8 +379,14 @@ object PanelApi {
                 })
             }
         }
-        LogBus.log("panel: $op 全量完成 ${accounts.size} 个账号")
-        res.sendJson(200, buildJsonObject { put("ok", JsonPrimitive(true)); put("results", results) })
+        LogBus.log("panel: $op 全量完成 $okCount/${accounts.size} 个账号")
+        // 顶层 ok 必须如实：旧实现恒 true，全失败也会报成功（与上面「无账号不假成功」自相矛盾）。
+        res.sendJson(200, buildJsonObject {
+            put("ok", JsonPrimitive(okCount > 0))
+            put("succeeded", JsonPrimitive(okCount))
+            put("total", JsonPrimitive(accounts.size))
+            put("results", results)
+        })
     }
 
     private fun ok(res: Res) = res.sendJson(200, buildJsonObject { put("ok", JsonPrimitive(true)) })
