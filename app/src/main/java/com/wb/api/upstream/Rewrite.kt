@@ -1,5 +1,6 @@
 package com.wb.api.upstream
 
+import com.wb.api.core.LogBus
 import com.wb.api.core.primText
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -69,6 +70,14 @@ object Rewrite {
         obj["stream"] = true
         // 3) max_completion_tokens → max_tokens。
         translateMaxCompletionTokens(obj)
+        // 3.0) max_output_tokens 是 Responses 风格的别名（直连 chat 端点的客户端会带）：
+        // 同样翻译成 max_tokens 并删掉别名键。否则第 3.1 步会把它当「没给额度」再补一个
+        // 目录值，body 里同时出现两个互相矛盾的额度。
+        if (!obj.containsKey("max_tokens")) {
+            val alt = obj["max_output_tokens"]
+            if (alt is Number || (alt is String && alt.trim().toLongOrNull() != null)) obj["max_tokens"] = alt
+        }
+        obj.remove("max_output_tokens")
         // 3.1) 客户端没给输出上限时，用模型元数据兜底：
         //      不是所有客户端都会带上限，缺省时上游行为不稳定（可能被截断或被拒），
         //      显式补一个「该模型声明的最大输出」更可预期。仅在客户端未指定时补，不覆盖用户值。
@@ -101,8 +110,16 @@ object Rewrite {
 
         // 6) DeepSeek 思维链：注入 enabled + 默认档 → 档位降级 → reasoning_content 回填。
         val modelName = obj["model"] as? String ?: ""
-        injectThinking(obj, defaultEfforts[modelName] ?: "")
+        // off 必须在 normalize 之前记录：normalize 对 off/none 会删键，之后就看不出
+        // 「客户端明确要关思考」了。
+        val effortOff = effortValueOff(obj)
+        // thinkingActive = 本次请求是否**真的会思考**（injectThinking 的返回值）。
+        // 预算下限只对「确实要思考」的请求生效：没声明思考、且处于 starved 区间时
+        // injectThinking 不注入，此时抬额度等于把「客户端要短回答」放大。
+        val thinkingActive = injectThinking(obj, defaultEfforts[modelName] ?: "")
         normalizeReasoningEffort(obj, efforts)
+        // 6.1) 输出预算下限：档位确定之后再抬（依赖最终 reasoning_effort）。
+        applyOutputFloor(obj, maxOutput, defaultEfforts[modelName] ?: "", thinkingActive, effortOff)
         backfillReasoningContent(obj)
 
         // 7) 指纹脱敏（开关）。
@@ -584,9 +601,71 @@ object Rewrite {
         return raw.trim().lowercase() in setOf("off", "none", "disabled")
     }
 
-    private fun injectThinking(obj: MutableMap<String, Any?>, defaultEffort: String) {
-        val model = obj["model"] as? String ?: return
-        if (!isDeepSeekModel(model)) return
+    /**
+     * 输出预算下限（对齐上游 `output_budget.go`，2026-11-08）。
+     *
+     * 上游把 reasoning 与正文算在**同一份** max_tokens 里。客户端指定高档位思考、又把
+     * max_tokens 给得比「这档思考起码要花掉的量」还小时，额度先被思考吃光，正文写到
+     * 一半就断（生产实测 cn:deepseek-v4.1-flash、同一「写 3000+ 字文档」提示词）：
+     *
+     * ```
+     * effort=high + max_tokens=2048 → total=4096 think=2048 正文=2048 finish=length
+     * effort=high + 不给额度         → total=16720 think=2998 正文=13722 finish=stop
+     * ```
+     *
+     * 客户端不可能知道思考要花多少，只能拍一个数——这个组合错误只能由网关修。
+     *
+     * 抬的是**上限**不是目标长度：模型写完自然停（high 大额度下正文 13722 就收尾，
+     * 不会因为上限变大而多写一个字），所以不改变答案长度、不额外计费。
+     *
+     * 不干预：没给显式额度（目录已补）、探活级额度（<16）、关闭思考、档位未知；
+     * 目录声明的 maxOutputTokens 更小时以目录封顶。
+     */
+    private fun applyOutputFloor(
+        obj: MutableMap<String, Any?>,
+        catalogMax: Long,
+        defaultEffort: String,
+        thinkingActive: Boolean,
+        effortOff: Boolean,
+    ) {
+        // 只有「这次真会思考」才需要给思考留额度：客户端没声明思考、又落在 starved 区间时
+        // injectThinking 根本不注入，此时抬额度等于无视「要短回答」的意图。
+        if (!thinkingActive || effortOff) return
+        // 目录没声明输出上限（冷启动缓存为空也会走到这里）时不抬：抬到超过模型真实能力的
+        // 值会被上游回 400（BAD_PARAMS 属 failFastKinds，直接终止轮转），从「能用」变「硬失败」。
+        if (catalogMax <= 0) return
+        val cur = outputBudget(obj)
+        if (cur < 16) return // 没给 / 探活（官方用 max_tokens=1 做 key 探活）
+        val th = asStringMap(obj["thinking"])
+        if ((th?.get("type") as? String)?.trim().equals("disabled", ignoreCase = true)) return
+        val effort = ((obj["reasoning_effort"] as? String) ?: (obj["reasoningEffort"] as? String))
+            ?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            ?: defaultEffort.trim().lowercase().takeIf { it.isNotEmpty() }
+            ?: return
+        val floor = when (effort) {
+            "minimal", "low" -> 4096L
+            "medium" -> 6144L
+            "high" -> 8192L
+            "xhigh" -> 12288L
+            "max" -> 16384L
+            else -> return
+        }
+        var target = maxOf(cur, floor)
+        if (target > catalogMax) target = catalogMax // 已保证 catalogMax > 0
+        if (target > cur) {
+            obj["max_tokens"] = target
+            LogBus.log("[rewrite] 输出预算 $cur → $target（档位 $effort，抬高上限不改变答案长度）")
+        }
+    }
+
+    /**
+     * @return 本次请求是否**真的会思考**（供 [applyOutputFloor] 决定要不要抬预算）。
+     *   false 的四种情形：非 DeepSeek（本端不改它的思考语义）、客户端显式关闭、
+     *   starved 区间（不注入思考）、无法识别。
+     */
+    private fun injectThinking(obj: MutableMap<String, Any?>, defaultEffort: String): Boolean {
+        val model = obj["model"] as? String ?: return false
+        if (!isDeepSeekModel(model)) return false
         val th = asStringMap(obj["thinking"])
         val typ = (th?.get("type") as? String)?.trim() ?: ""
         // 显式 off/none **优先于一切 enabled 形态**（客户端要的是「关」）：写官方唯一的
@@ -596,23 +675,24 @@ object Rewrite {
             if (th == null) obj["thinking"] = mutableMapOf<String, Any?>("type" to "disabled")
             else th["type"] = "disabled"
             obj.remove("reasoning_effort"); obj.remove("reasoningEffort")
-            return
+            return false
         }
         if (typ.isEmpty()) {
             // 客户端没声明思考：小额预算下思考必然吃光正文 → 不注入（见上面的实测表）。
             // 16 以下不拦：官方客户端用 max_tokens=1 做 key 探活，那种请求按原样即可。
             val budget = outputBudget(obj)
-            if (budget in STARVED_BUDGET_LOW until STARVED_BUDGET_HIGH) return
+            if (budget in STARVED_BUDGET_LOW until STARVED_BUDGET_HIGH) return false
         }
         if (typ.isNotEmpty()) {
             if (typ.equals("disabled", ignoreCase = true)) {
-                obj.remove("reasoning_effort"); obj.remove("reasoningEffort"); return
+                obj.remove("reasoning_effort"); obj.remove("reasoningEffort"); return false
             }
-            ensureDeepSeekEffort(obj, defaultEffort); return
+            ensureDeepSeekEffort(obj, defaultEffort); return true
         }
         if (th == null) obj["thinking"] = mutableMapOf<String, Any?>("type" to "enabled")
         else th["type"] = "enabled"
         ensureDeepSeekEffort(obj, defaultEffort)
+        return true
     }
 
     private fun ensureDeepSeekEffort(obj: MutableMap<String, Any?>, defaultEffort: String) {

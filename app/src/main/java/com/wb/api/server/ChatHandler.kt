@@ -58,6 +58,8 @@ object ChatHandler {
         // 注意：6020/6021（ErrKind.UPSTREAM_BUSY）**不在这里**。上游 10-29（PR #108）做了
         // 语义修正：实测同一模型同一分钟内既有 6021 也有成功（两个号连续 6021 后 33 秒就通），
         // 说明**换号有意义**；因此恢复请求内轮转，终态改回 429 + Retry-After（见 mapError）。
+        // 11-01 再细分（#125）：**6020 且带 data.retry_after** 时不再换号（上游已给出通道级
+        // 等待口径，换号必撞同一堵墙），在下方分支里直接 mapError；6021 仍轮转。
     )
 
     private val frameWhitelist = setOf(
@@ -332,6 +334,21 @@ object ChatHandler {
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                         LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
                         if (kind in failFastKinds) { mapError(res, kind, lastBody, model, false, realm); return }
+                        // 6020 带 data.retry_after（实测 40s，通道级口径：队列按 client_user_type
+                        // 全局共享）时**不再换号**：上游已给出「N 秒后重试」，这几毫秒内换号必然撞
+                        // 同一堵墙，只是把同一份排队请求多发 MAX_ROTATE 次（上游 issue #125）。
+                        // 6021（队列满、无 retry_after）保留轮转：那是间歇空窗，换号有机会碰上。
+                        // 只认 6020（queue.waiting）：6021（queue.full）没有 retry_after，
+                        // 是间歇空窗、换号有机会碰上，必须继续轮转。仅凭 ErrKind 判定会把
+                        // 两者混在一起，6021 一旦也带 data.retry_after 就会丢掉轮转。
+                        if (kind == ErrKind.UPSTREAM_BUSY && Classify.isQueueWaiting(text)) {
+                            val bodyRetry = Classify.parseQueueRetryAfter(text)
+                            if (bodyRetry > 0) {
+                                LogBus.log("$realm|$model 6020 排队 retry_after=${bodyRetry}s → 不换号，直接透传 429")
+                                mapError(res, kind, lastBody, model, false, realm)
+                                return
+                            }
+                        }
                     }
                 } finally {
                     Gateway.pool.release(auth.uid)
@@ -680,7 +697,13 @@ object ChatHandler {
                 } ?: break
                 if (!line.startsWith("data:")) {
                     // SSE 注释 / 心跳行（": ping" 之类）：原样转发，帮助客户端与中间代理保活。
-                    if (line.isNotBlank() && started) res.chunk("$line\n")
+                    //
+                    // ⚠️ 必须补**两个**换行（补成独立帧）。本端是「逐行重写」：data 帧自己
+                    // 写 "...\n\n"，注释行只写一个 "\n" 的话，下一个 data 帧会与它粘成
+                    // ": heartbeat\ndata: {...}" 一整块——客户端按 "\n\n" 切帧后这块不以
+                    // "data:" 开头，直接丢弃。上游 11-03 实测（GLM 工具调用首帧带 id+name）
+                    // 正是这样被吞掉的：调用消失、output 变 null、客户端对 null 崩。
+                    if (line.isNotBlank() && started) res.chunk("$line\n\n")
                     continue
                 }
                 val payload = line.substring(5).trim()

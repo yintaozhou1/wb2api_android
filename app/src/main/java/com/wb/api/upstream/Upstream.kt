@@ -2010,6 +2010,19 @@ object Classify {
     }
 
     /**
+     * 只认 6020（`queue.waiting`，**带 data.retry_after** 的通道级排队）。
+     *
+     * 与 [isUpstreamBusy] 分开的理由：6020 与 6021 的处置相反——6020 已经给出
+     * 「N 秒后重试」，换号只会把同一份排队请求多发几次（上游 issue #125 规定不再换号）；
+     * 6021（`queue.full`，间歇空窗）换号仍有机会碰上，必须保留轮转。
+     * 只判 ErrKind 布尔值会把两者混为一谈。
+     */
+    fun isQueueWaiting(body: String): Boolean {
+        val b = body.lowercase().replace("\\", "")
+        return codeMarker(b, "6020")
+    }
+
+    /**
      * 6020/6021 排队响应的重试等待（秒）。上游把口径放在 **body 的 `data.retry_after`**
      * （整数秒）而不是 Retry-After 头（2026-10-28 真机：429 + code 6020，data 里是
      * queue_position/queue_size/retry_after/estimated_wait，头侧没有任何等待信息）。
