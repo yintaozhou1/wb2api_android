@@ -1176,21 +1176,13 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                     val overlayCtx = androidx.compose.ui.platform.LocalContext.current
                     WbSwitchRow(
                         title = "网关地址浮窗",
-                        summary = "启动网关后在其它应用上层显示 127.0.0.1:端口（需「显示在其他应用上层」权限）",
+                        summary = "启动网关后在其它应用上层显示 127.0.0.1:端口 · 双击浮窗回到应用，拖动可移动（需「显示在其他应用上层」权限）",
                         checked = draft.ui.overlay,
                         onCheckedChange = { on ->
                             applyUi(draft.ui.copy(overlay = on))
-                            if (!on) {
-                                // 浮窗是系统级窗口，不主动摘掉就会一直盖在别的应用上。
-                                com.wb.api.overlay.AddressOverlay.hide()
-                            } else if (com.wb.api.Gateway.serverRunning() &&
-                                com.wb.api.overlay.AddressOverlay.canDraw(overlayCtx)
-                            ) {
-                                com.wb.api.overlay.AddressOverlay.show(
-                                    overlayCtx,
-                                    "127.0.0.1:${com.wb.api.Gateway.displayPort()}",
-                                )
-                            }
+                            // 浮窗是系统级窗口，配置改了就要立刻对齐（关掉时必须主动摘掉，
+                            // 否则会一直盖在别的应用上）；判定统一在 sync 里。
+                            com.wb.api.overlay.AddressOverlay.sync(overlayCtx)
                             if (on && !com.wb.api.overlay.AddressOverlay.canDraw(overlayCtx)) {
                                 android.widget.Toast.makeText(
                                     overlayCtx,

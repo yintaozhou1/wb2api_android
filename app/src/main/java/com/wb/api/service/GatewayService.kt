@@ -157,11 +157,12 @@ class GatewayService : Service() {
     /** 按配置与权限同步地址浮窗（关闭开关 → 移除）。 */
     private fun syncOverlay() {
         runCatching {
-            if (!Gateway.isInitialized() || !Gateway.store.config.ui.overlay) {
+            if (!Gateway.isInitialized()) {
                 AddressOverlay.hide()
                 return
             }
-            AddressOverlay.show(this, "127.0.0.1:${Gateway.displayPort()}")
+            // 判定统一在 AddressOverlay.sync（配置 + 运行态 + 权限），三处调用点不再各写一份。
+            AddressOverlay.sync(this)
         }.onFailure { e -> LogBus.log("[overlay] 同步浮窗失败：${e.message}") }
     }
 

@@ -1,6 +1,7 @@
 package com.wb.api
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -27,7 +28,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            // 先查再请求：旋转屏幕会重建 Activity，无条件 launch 会在「已授予」或「曾被拒」
+            // 的设备上反复弹框。
             registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
                 .launch(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -68,11 +73,8 @@ class MainActivity : ComponentActivity() {
             if (!Gateway.isInitialized()) return
             // 用 serverRunning() 而不是 isRunning()：停止过程中前者才是「端口是否真的还活着」，
             // 与 Service 侧 syncOverlay 的判定保持一致，避免两边互相 show/hide 打架。
-            if (!Gateway.store.config.ui.overlay || !Gateway.serverRunning() || !AddressOverlay.canDraw(this)) {
-                AddressOverlay.hide()
-                return
-            }
-            AddressOverlay.show(this, "127.0.0.1:${Gateway.displayPort()}")
+            // 单一收口：配置 + 运行态 + 权限的判定只在 AddressOverlay.sync 里写一份。
+            AddressOverlay.sync(this)
         }
     }
 }

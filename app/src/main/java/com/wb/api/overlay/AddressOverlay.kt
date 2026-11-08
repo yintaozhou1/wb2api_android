@@ -15,11 +15,12 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import com.wb.api.Gateway
 import com.wb.api.MainActivity
@@ -31,7 +32,11 @@ import kotlin.math.roundToInt
  * 网关地址浮窗（`SYSTEM_ALERT_WINDOW`）。
  *
  * 形态：一颗**液态玻璃胶囊**，显示 `127.0.0.1:<port>` 与运行状态点（浮窗只在网关运行期
- * 存在，所以点的含义就是「运行中」）；点击回到应用，拖动可换位置（位置落盘，下次沿用）。
+ * 存在，所以点的含义就是「运行中」）；**双击**回到应用，拖动可换位置（位置落盘，下次沿用）。
+ *
+ * 为什么是双击而不是单击：这是常驻在**其它应用之上**的浮窗，单击是最容易误触的手势
+ * （滑动列表、点屏幕边缘都会产生一次「按下+抬起」）。单击即跳转会频繁打断用户正在做
+ * 的事，所以把「回到应用」放到双击，单击不产生任何动作。
  *
  * 为什么不用 Compose 画：overlay 窗口里的 `ComposeView` 需要宿主提供
  * `ViewTreeLifecycleOwner / SavedStateRegistryOwner / ViewModelStoreOwner`，而 Service
@@ -74,6 +79,8 @@ object AddressOverlay {
     @Volatile private var view: GlassPill? = null
     @Volatile private var params: WindowManager.LayoutParams? = null
     @Volatile private var windowManager: WindowManager? = null
+    /** 已进入淡出、还没 removeView 的实例（show 时复用它，避免两个窗口叠加）。主线程访问。 */
+    private var pendingHide: GlassPill? = null
 
     /** 是否已获得「显示在其他应用上层」权限。 */
     fun canDraw(ctx: Context): Boolean = Settings.canDrawOverlays(ctx)
@@ -135,7 +142,22 @@ object AddressOverlay {
         return m.widthPixels to m.heightPixels
     }
 
-    fun isShowing(): Boolean = view?.isAttachedToWindow == true
+    /**
+     * 按「配置 + 网关运行态 + 权限」把窗口对齐到应然状态（**单一收口**）。
+     *
+     * 此前 show/hide 分散在设置页开关、MainActivity.onResume、GatewayService.syncOverlay
+     * 三处，判定条件各不相同（有一处不检查 canDraw），且「恢复默认」改了 overlay 配置
+     * 却不会同步窗口 —— 结果是「配置说开、屏上没有」。统一走这里。
+     */
+    fun sync(ctx: Context) {
+        val app = ctx.applicationContext
+        val want = runCatching { Gateway.store.config.ui.overlay }.getOrDefault(true)
+        if (!want || !Gateway.serverRunning() || !canDraw(app)) {
+            hide()
+            return
+        }
+        show(app, "127.0.0.1:${Gateway.displayPort()}")
+    }
 
     /**
      * 按当前主题重算玻璃取值（应用内主题切换后由 MainActivity 调用）。
@@ -164,11 +186,37 @@ object AddressOverlay {
     }
 
     private fun showOnMain(ctx: Context, address: String) {
+        // 正在淡出的实例：复用它（取消动画、恢复可见与触摸），绝不再建第二个窗口 ——
+        // 否则「关→开」两次点击间隔小于 140ms 时，屏上会短暂叠两个胶囊。
+        pendingHide?.let { old ->
+            pendingHide = null
+            old.animate().cancel()
+            old.alpha = 1f
+            old.scaleX = 1f
+            old.scaleY = 1f
+            old.isEnabled = true
+            val wm2 = old.context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            runCatching {
+                val oldLp = old.layoutParams as? WindowManager.LayoutParams
+                if (oldLp != null && wm2 != null) {
+                    oldLp.flags = oldLp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                    wm2.updateViewLayout(old, oldLp)
+                }
+            }
+            view = old
+            params = old.layoutParams as? WindowManager.LayoutParams
+            windowManager = wm2
+            old.setAddress(address)
+            return
+        }
         val current = view
-        // isAttachedToWindow 必须判：用户撤销「显示在其他应用上层」时系统会直接移除窗口，
-        // 但单例里的 view 仍非空 —— 只看非空会命中早退分支，重新授权后浮窗**永远不再出现**。
-        if (current != null && current.isAttachedToWindow) {
-            current.setAddress(address)
+        // 判活必须看 parent 而不是 isAttachedToWindow：addView 之后要到下一次
+        // performTraversals 才 attach，同一帧里第二次 show() 会命中 isAttached=false，
+        // 走到下面的 remove+重建分支（重复 addView、闪一下）。parent 在 setView 时就已赋值。
+        // 用户撤销「显示在其他应用上层」时系统会直接移除窗口（parent 变 null），
+        // 但单例里的 view 仍非空 —— 只看非空会命中早退，重新授权后浮窗永远不再出现。
+        if (current != null && current.parent != null) {
+            if (current is GlassPill) current.setAddress(address)
             return
         }
         if (current != null) {
@@ -232,14 +280,28 @@ object AddressOverlay {
         view = null
         params = null
         windowManager = null
+        // 淡出的 140ms 里窗口仍在屏上：登记成 pendingHide（show 时复用），
+        // 并先关掉触摸 —— 否则这 140ms 内还能被双击（网关已停，却把应用拉起来）
+        // 或拖动（位置改了但窗口马上就没了）。
+        pendingHide = v
         runCatching { v.context.applicationContext.unregisterComponentCallbacks(configCallbacks) }
+        runCatching {
+            val lp = v.layoutParams as? WindowManager.LayoutParams
+            if (lp != null && wm != null) {
+                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                wm.updateViewLayout(v, lp)
+            }
+        }
         v.animate().cancel()
         v.animate()
             .alpha(0f)
             .scaleX(0.92f)
             .scaleY(0.92f)
             .setDuration(140)
-            .withEndAction { runCatching { wm?.removeView(v) } }
+            .withEndAction {
+                runCatching { wm?.removeView(v) }
+                if (pendingHide === v) pendingHide = null
+            }
             .start()
     }
 
@@ -248,6 +310,12 @@ object AddressOverlay {
         val v = view ?: return
         val lp = params ?: return
         val wm = windowManager ?: return
+        // 还没量到尺寸时 clampX 的 lo 会退化成 0，把「半出屏」的负 x 夹成 0 **并写回磁盘**
+        // （下次启动位置就丢了）。等一帧再夹。
+        if (v.width <= 0 || v.height <= 0) {
+            v.post { if (view === v && v.width > 0) clampToBounds() }
+            return
+        }
         val (sw, sh) = screenSize(v.context)
         val nx = clampX(lp.x, v.width, sw)
         val ny = clampY(lp.y, v.height, sh)
@@ -270,8 +338,12 @@ object AddressOverlay {
      */
     private val configCallbacks = object : android.content.ComponentCallbacks {
         override fun onConfigurationChanged(newConfig: Configuration) {
-            view?.applyTheme()
-            clampToBounds()
+            // 此刻 View 还没按新配置重新 measure，width/height 是旧值：直接 clamp 会把
+            // 「按旧尺寸算出的位置」写回 prefs。等一帧再夹。
+            main.post {
+                view?.applyTheme()
+                clampToBounds()
+            }
         }
 
         override fun onLowMemory() {}
@@ -283,13 +355,42 @@ object AddressOverlay {
         wm: WindowManager,
         prefs: SharedPreferences,
     ) {
-        val slop = 6f * v.resources.displayMetrics.density
+        val dm = v.resources.displayMetrics
+        val slop = 6f * dm.density
+        // 无障碍/TalkBack 的「双击激活」走 click 通道：挂上 listener 并让双击分支
+        // performClick()，否则无障碍用户永远无法通过浮窗回到应用。
+        v.setOnClickListener { openApp(v.context) }
+        // 双击时间窗用系统口径（第一次抬起到第二次按下的间隔，实测约 300ms），
+        // 不用自己拍一个数：与系统其它双击交互手感一致。
+        // 用静态方法 getDoubleTapTimeout()（API 1 起）而不是新实例方法
+        // getDoubleTapTimeoutMillis()（API 36.1 才有，minSdk 32 会 NoSuchMethodError）。
+        val doubleTapTimeout = ViewConfiguration.getDoubleTapTimeout().toLong()
+        // 单次点击的「按下→抬起」上限：超过即视为长按，不参与双击配对。
+        val tapTimeout = 400L
+        // 两次点击的位置容差：手指不可能落回同一像素，纯时间判定会把「连点两下边缘」误判。
+        val doubleTapSlop = 48f * dm.density
+
         var downRawX = 0f
         var downRawY = 0f
         var startX = 0
         var startY = 0
         var dragging = false
         var downAt = 0L
+        // 本次按下是否构成「双击的第二下」：必须在 DOWN 判定（系统语义是
+        // 「第一次抬起 → 第二次按下」的间隔），在 UP 用「抬起-抬起」会把按压时长也算进去。
+        var isSecondTap = false
+        // 候选的「第一次点击」：抬起时刻 + 位置。0 表示当前没有候选。
+        var lastTapUpAt = 0L
+        var lastTapX = 0f
+        var lastTapY = 0f
+        // 拖动时每帧都要夹取：屏幕尺寸在 DOWN 时取一次，避免每帧一次 Binder + 分配。
+        var screenW = 0
+        var screenH = 0
+
+        fun clearTapCandidate() {
+            lastTapUpAt = 0L
+        }
+
         v.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -298,7 +399,18 @@ object AddressOverlay {
                     startX = lp.x
                     startY = lp.y
                     dragging = false
-                    downAt = SystemClock.uptimeMillis()
+                    downAt = e.eventTime
+                    val (sw, sh) = screenSize(v.context)
+                    screenW = sw
+                    screenH = sh
+                    // 双击判定放在这里：间隔 = 第一次**抬起** → 本次**按下**（eventTime，
+                    // 不用 SystemClock.uptimeMillis：主线程卡顿会单向放大间隔，吞掉双击）。
+                    isSecondTap = lastTapUpAt != 0L &&
+                        downAt - lastTapUpAt <= doubleTapTimeout &&
+                        abs(e.rawX - lastTapX) <= doubleTapSlop &&
+                        abs(e.rawY - lastTapY) <= doubleTapSlop
+                    // 不是第二下：上一次只是单击（不动作），候选在这里过期。
+                    if (!isSecondTap) clearTapCandidate()
                     true
                 }
 
@@ -306,11 +418,14 @@ object AddressOverlay {
                     val dx = e.rawX - downRawX
                     val dy = e.rawY - downRawY
                     // 超过 6dp 才算拖动：手指抖动不该把「点击」变成「位移」。
-                    if (!dragging && (abs(dx) > slop || abs(dy) > slop)) dragging = true
+                    if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
+                        dragging = true
+                        // 拖动打断双击配对：否则「单击 → 拖动 → 抬起」会被拼成一次双击。
+                        clearTapCandidate()
+                    }
                     if (dragging) {
-                        val (sw, sh) = screenSize(v.context)
-                        lp.x = clampX(startX + dx.roundToInt(), v.width, sw)
-                        lp.y = clampY(startY + dy.roundToInt(), v.height, sh)
+                        lp.x = clampX(startX + dx.roundToInt(), v.width, screenW)
+                        lp.y = clampY(startY + dy.roundToInt(), v.height, screenH)
                         runCatching { wm.updateViewLayout(v, lp) }
                     }
                     true
@@ -319,13 +434,46 @@ object AddressOverlay {
                 MotionEvent.ACTION_UP -> {
                     if (dragging) {
                         prefs.edit().putInt(KEY_X, lp.x).putInt(KEY_Y, lp.y).apply()
-                    } else if (SystemClock.uptimeMillis() - downAt < 400) {
-                        openApp(v.context)
+                        clearTapCandidate()
+                    } else if (e.eventTime - downAt < tapTimeout) {
+                        if (isSecondTap) {
+                            // 双击确认：先清候选再打开。三连击时第三下重新成为候选，
+                            // 不会因为残留在窗口内而再触发一次打开。
+                            clearTapCandidate()
+                            if (runCatching { Gateway.store.config.ui.haptics }.getOrDefault(true)) {
+                                // 与设置页「触感反馈」开关一致；用 VIRTUAL_KEY（轻触）而不是
+                                // LONG_PRESS —— 后者是「长按」的语义。
+                                v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            }
+                            // 走 performClick（而不是直接 openApp）：既触发上面挂的 listener，
+                            // 也让无障碍框架拿到一次真实的 click 事件。
+                            v.performClick()
+                        } else {
+                            // 第一次点击：**只登记候选，不做任何动作**。
+                            // 这里绝不能直接 openApp —— 否则双击会变成「打开两次」，
+                            // 且单击误触会立刻把用户从当前应用拽走。
+                            lastTapUpAt = e.eventTime
+                            lastTapX = e.rawX
+                            lastTapY = e.rawY
+                        }
+                    } else {
+                        // 长按抬起：不参与双击配对。
+                        clearTapCandidate()
                     }
                     true
                 }
 
-                MotionEvent.ACTION_CANCEL -> true
+                MotionEvent.ACTION_CANCEL -> {
+                    // 拖动中被取消（撤销权限/系统移窗/来电抢占）也要落盘，否则屏幕位置与
+                    // prefs 不一致，下次显示直接跳回旧坐标。
+                    if (dragging) {
+                        prefs.edit().putInt(KEY_X, lp.x).putInt(KEY_Y, lp.y).apply()
+                        dragging = false
+                    }
+                    clearTapCandidate()
+                    true
+                }
+
                 else -> false
             }
         }

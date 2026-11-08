@@ -871,6 +871,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val cfg = Gateway.store.config.copy(ui = ui)
         Gateway.store.saveConfig(cfg)
         _config.value = cfg
+        // 浮窗开关/外观变化后立刻对齐窗口（含「恢复本组默认」把 overlay 改回 true 的路径：
+        // 旧实现只在开关的 onCheckedChange 里同步，恢复默认会出现「配置说开、屏上没有」）。
+        runCatching { com.wb.api.overlay.AddressOverlay.sync(getApplication()) }
     }
 
     /** 恢复出厂默认（保留 api_key，避免把局域网鉴权关掉）。 */
@@ -879,6 +882,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val fresh = GatewayConfig(api_key = Gateway.store.config.api_key)
             Gateway.applyConfig(fresh)
             _config.value = fresh
+            // 恢复默认会把 overlay 置回 true：窗口要跟着回来，不能等下次 onResume。
+            runCatching { com.wb.api.overlay.AddressOverlay.sync(getApplication()) }
             toast("已恢复默认设置")
         }
     }
