@@ -44,6 +44,23 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import com.wb.api.core.SecretClipboard
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -415,14 +432,52 @@ fun AccountsScreen(ov: Overview, vm: AppViewModel, onAdd: () -> Unit, onOpen: (A
         AccFilter.Disabled -> ov.views.filter { it.disabled }
         AccFilter.Paused -> ov.views.filter { it.paused }
     }
-    // 表头做成**一块**液态玻璃面板（与模型页同一套语言，见 ModelsScreen）：上半是「添加
-    // 账号」动作条、细分隔线、下半是筛选分段控件。与模型页的区别：这里没有搜索框，而是
-    // 一个偏「动作」的添加入口（图标 + 文案 + 尾部 ＋），一眼能分清两页。
-    //
+
+    // ---------- 多选与批量导出 ----------
+    // 选择模式只作用于**当前筛选**的可见集合：全选/反选都按 filtered 计算，
+    // 避免「全选」把看不见的账号也选上（导出后用户数不对，且无法核对）。
+    var selecting by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showExport by remember { mutableStateOf(false) }
+    // 账号被移除后选中集里会残留已不存在的 uid：不清理就会出现「已选 3 个、导出 2 个」，
+    // 导出的 JSON 还会少一条（credentialJsonBulk 对不存在的 uid 静默跳过）。
+    androidx.compose.runtime.LaunchedEffect(ov.views) {
+        val alive = ov.views.mapTo(HashSet()) { it.uid }
+        if (selected.any { it !in alive }) selected = selected.filterTo(HashSet()) { it in alive }
+        if (ov.views.isEmpty()) selecting = false
+    }
+    // 返回键先退出选择模式，而不是直接退出应用（targetSdk 37 起返回必须走 OnBackPressedDispatcher，
+    // 系统不再派发 KEYCODE_BACK，裸 onBackPressed 收不到）。
+    // 退出时**不清空** selected：表头有 120ms 的淡出动画，同一时刻清空会让淡出中的
+    // 旧表头闪一下「已选 0 个」。重新进入时由入口（选择按钮 / 长按）决定初始选中集。
+    BackHandler(enabled = selecting) { selecting = false }
+
+    val visibleUids = filtered.map { it.uid }
+    val allSelected = visibleUids.isNotEmpty() && visibleUids.all { it in selected }
+
+    val ctx = LocalContext.current
+    // SAF 的目标 Uri 只能在回调里拿到，先把待写内容存下来：避免用户在系统文件选择器里
+    // 停留期间账号列表变化（或又点了别的），导致「选的是 A、写的是 B」。
+    // 必须可保存：在系统文件选择器停留期间若发生配置变更（旋屏 / 深浅色 / 分屏），
+    // `remember` 会被重置为 null，回调就写不出内容 —— 但 SAF 已经把目标文件创建成 0 字节，
+    // 用户看到的是「导出失败」+ 一个损坏文件。
+    var pendingExport by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
+    val createDoc = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val text = pendingExport
+        pendingExport = null
+        when {
+            uri == null -> vm.toast("已取消导出")
+            text == null -> vm.toast("没有可导出的内容")
+            else -> vm.exportCredentialsToFile(uri, text)
+        }
+    }
+
+    // 表头做成**一块**液态玻璃面板（与模型页同一套语言，见 ModelsScreen）：上半是动作条、
+    // 细分隔线、下半是筛选分段控件；进入选择模式后整块换成批量动作。
     // 高度**实测**（onSizeChanged 挂在 padding 之外）：表头是浮动的兄弟节点、不占内容流，
     // 列表必须按它的实际高度留白，否则改表头就会「首张卡片贴到玻璃底下」。
     var headerPx by remember { mutableStateOf(0) }
-    val density = androidx.compose.ui.platform.LocalDensity.current
+    val density = LocalDensity.current
     val headerSpace = if (headerPx > 0) with(density) { headerPx.toDp() } else AccountsHeaderSpace
     WbGlassHeaderPage(
         header = {
@@ -433,31 +488,102 @@ fun AccountsScreen(ov: Overview, vm: AppViewModel, onAdd: () -> Unit, onOpen: (A
                     .padding(horizontal = WbD.pageH)
                     .padding(top = WbD.pageTop, bottom = WbD.headerGap),
             ) {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .wbGlass(
-                            shape = remember { com.kyant.shapes.RoundedRectangle(WbD.radius, com.kyant.shapes.RoundedCornerStyle.Continuous) },
-                            tint = WbGlass.neutralTint(),
-                            lensHeight = 12.dp,
-                            lensAmount = 12.dp,
-                        )
-                        .padding(WbD.gapS),
-                ) {
-                    // ① 添加账号：透明底动作条 —— 与玻璃面板共用一块底，不再自带按钮底色。
-                    WbGlassActionRow(
-                        "添加账号", "通过 OAuth 登录后自动入池", MiuixIcons.Add, onClick = onAdd,
-                        trailing = { WbRealmCounts(ov.views) },
-                    )
-                    // ② 细分隔线：区分「动作」与「筛选」两栏（同一块玻璃里的分组）。
-                    WbHairline(Modifier.padding(vertical = WbD.gapS))
-                    // ③ 筛选：玻璃面板上的分段控件（plain=true，避免两层底色压叠）。
-                    WbSegmented(
-                        AccFilter.entries.map { it.label },
-                        AccFilter.entries.indexOf(filter),
-                        plain = true,
-                        onSelect = { filter = AccFilter.entries[it] },
-                    )
+                // 两套表头之间用淡入淡出切换：横向滑动会让高度变化与内容错位更刺眼。
+                AnimatedContent(
+                    targetState = selecting,
+                    // 关掉尺寸动画：表头高度是实测值、直接驱动列表 contentPadding，
+                    // 尺寸动画会让过渡的 160ms 内每帧重排整屏列表。
+                    transitionSpec = {
+                        (fadeIn(tween(160)) togetherWith fadeOut(tween(120))).using(null)
+                    },
+                    label = "accountsHeader",
+                ) { sel ->
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .wbGlass(
+                                shape = remember { com.kyant.shapes.RoundedRectangle(WbD.radius, com.kyant.shapes.RoundedCornerStyle.Continuous) },
+                                tint = WbGlass.neutralTint(),
+                                lensHeight = 12.dp,
+                                lensAmount = 12.dp,
+                            )
+                            .padding(WbD.gapS),
+                    ) {
+                        if (sel) {
+                            Row(
+                                Modifier.fillMaxWidth().heightIn(min = WbD.tapMin).padding(horizontal = WbD.gapS),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "已选 ${selected.size} 个",
+                                        style = MiuixTheme.textStyles.body1,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "当前筛选共 ${visibleUids.size} 个",
+                                        style = MiuixTheme.textStyles.footnote2,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        maxLines = 1,
+                                    )
+                                }
+                                WbMiniAction("完成") { selecting = false }
+                            }
+                            WbHairline(Modifier.padding(vertical = WbD.gapS))
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = WbD.gapS),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(WbD.gapS),
+                            ) {
+                                WbMiniAction(if (allSelected) "取消全选" else "全选", enabled = visibleUids.isNotEmpty()) {
+                                    selected = if (allSelected) {
+                                        selected - visibleUids.toSet()
+                                    } else {
+                                        selected + visibleUids.toSet()
+                                    }
+                                }
+                                WbMiniAction("反选", enabled = visibleUids.isNotEmpty()) {
+                                    val vis = visibleUids.toSet()
+                                    // 语义是「可见集合里选中的变未选、未选的变选中」，不可见的保持原样。
+                                    selected = (selected - vis) + (vis - selected)
+                                }
+                                Spacer(Modifier.weight(1f))
+                                WbButton(
+                                    "导出",
+                                    onClick = { showExport = true },
+                                    enabled = selected.isNotEmpty(),
+                                    variant = WbButtonVariant.Tonal,
+                                    icon = MiuixIcons.FileDownloads,
+                                    glass = true,
+                                )
+                            }
+                        } else {
+                            // ① 添加账号：透明底动作条 —— 与玻璃面板共用一块底，不再自带按钮底色。
+                            WbGlassActionRow(
+                                "添加账号", "通过 OAuth 登录后自动入池", MiuixIcons.Add, onClick = onAdd,
+                                trailing = { WbRealmCounts(ov.views) },
+                            )
+                            // ② 细分隔线：区分「动作」与「筛选」两栏（同一块玻璃里的分组）。
+                            WbHairline(Modifier.padding(vertical = WbD.gapS))
+                            // ③ 筛选 + 多选入口。分段控件让出右侧固定宽度给「选择」，
+                            //    保证 5 个分段在任何屏宽下都不被文字按钮挤压换行。
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Box(Modifier.weight(1f)) {
+                                    WbSegmented(
+                                        AccFilter.entries.map { it.label },
+                                        AccFilter.entries.indexOf(filter),
+                                        plain = true,
+                                        onSelect = { filter = AccFilter.entries[it] },
+                                    )
+                                }
+                                 WbMiniAction("选择", enabled = ov.views.isNotEmpty()) {
+                                    // 从「选择」入口进入时从空白开始（长按入口则预选该账号）。
+                                    selected = emptySet()
+                                    selecting = true
+                                }
+                            }
+                        }
+                    }
                 }
             }
         },
@@ -494,14 +620,113 @@ fun AccountsScreen(ov: Overview, vm: AppViewModel, onAdd: () -> Unit, onOpen: (A
                     }
                 }
             } else {
-                items(filtered, key = { it.uid }) { a -> AccountCard(a) { onOpen(a) } }
+                items(filtered, key = { it.uid }) { a ->
+                    AccountCard(
+                        a = a,
+                        selecting = selecting,
+                        selected = a.uid in selected,
+                        onClick = { if (selecting) selected = selected.toggle(a.uid) else onOpen(a) },
+                        onLongClick = {
+                            if (!selecting) {
+                                selecting = true
+                                selected = selected + a.uid
+                            }
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    if (showExport) {
+        val n = selected.size
+        OverlayDialog(
+            show = true,
+            title = "导出登录凭证",
+            summary = "已选 $n 个账号。导出内容含 access_token / refresh_token，等同于账号本人，请勿外传。",
+            onDismissRequest = { showExport = false },
+        ) {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(WbD.gapS)) {
+                WbHintBlock(
+                    title = "敏感信息",
+                    body = "复制到剪贴板已标记为敏感内容，系统不会在预览里显示明文；仍建议用完后清除剪贴板。",
+                    icon = MiuixIcons.Lock,
+                )
+                WbButton(
+                    "复制到剪贴板",
+                    onClick = {
+                        val json = vm.credentialJsonBulk(selected)
+                        if (json == null) {
+                            vm.toast("选中的账号已不存在，请重新选择")
+                        } else {
+                            val ok = SecretClipboard.copySensitive(ctx, json)
+                            vm.toast(
+                                if (ok) "已复制 $n 个账号的凭证，请勿外传"
+                                else "复制失败：剪贴板不可用",
+                            )
+                            if (ok) showExport = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    variant = WbButtonVariant.Tonal,
+                    icon = MiuixIcons.Copy,
+                )
+                WbButton(
+                    "导出为文件",
+                    onClick = {
+                        val json = vm.credentialJsonBulk(selected)
+                        if (json == null) {
+                            vm.toast("选中的账号已不存在，请重新选择")
+                        } else {
+                            pendingExport = json
+                            runCatching { createDoc.launch(vm.credentialFileName()) }
+                                .onFailure { vm.toast("无法打开文件保存器：${it.message}") }
+                            showExport = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    variant = WbButtonVariant.Tonal,
+                    icon = MiuixIcons.FileDownloads,
+                )
+                WbTextButton("取消", onClick = { showExport = false }, modifier = Modifier.fillMaxWidth())
             }
         }
     }
 }
 
+/** 集合内切换单个元素（保持 Set 不可变语义，避免就地改引起重组不可见）。 */
+private fun Set<String>.toggle(id: String): Set<String> =
+    if (id in this) this - id else this + id
+
+/** 玻璃表头里的小文字动作（28dp 触控高度，不抢分段控件宽度）。 */
 @Composable
-private fun AccountCard(a: AccountView, onClick: () -> Unit) {
+private fun WbMiniAction(text: String, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .wbPress(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text,
+            style = MiuixTheme.textStyles.footnote1,
+            fontWeight = FontWeight.Medium,
+            color = if (enabled) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+@Composable
+private fun AccountCard(
+    a: AccountView,
+    selecting: Boolean,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     val statusColor = when {
         a.disabled -> WbPalette.danger
         a.paused -> WbPalette.info
@@ -514,7 +739,28 @@ private fun AccountCard(a: AccountView, onClick: () -> Unit) {
         a.cool_remaining_sec > 0 -> "冷却中"
         else -> "可用"
     }
-    WbSection {
+    val haptics = LocalHapticFeedback.current
+    val animOn = LocalWbAnimations.current
+    // 勾选指示器：选中时从 0 弹到 1（关动画偏好时直接到位）。
+    val checkScale by animateFloatAsState(
+        targetValue = if (selected) 1f else 0f,
+        animationSpec = tween(if (animOn) 180 else 0),
+        label = "accCheck",
+    )
+    WbSection(
+        // 单一手势检测器（不在外层再叠 clickable）：detectTapGestures 会在 down 时消费事件，
+        // 与 clickable 的 tap 检测竞争会导致「选择模式下点卡片没反应」。
+        // 内部「详情 / 操作」行在选择模式被禁用（onClick = null），因此不会出现双触发。
+        modifier = Modifier.pointerInput(a.uid, selecting) {
+            detectTapGestures(
+                onTap = { if (selecting) onClick() },
+                onLongPress = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onLongClick()
+                },
+            )
+        },
+    ) {
         Column(Modifier.fillMaxWidth()) {
             Row(
                 Modifier.fillMaxWidth().heightIn(min = WbD.tapMin).padding(horizontal = WbD.cardPad, vertical = WbD.gapS),
@@ -537,11 +783,43 @@ private fun AccountCard(a: AccountView, onClick: () -> Unit) {
                         maxLines = 1,
                     )
                 }
-                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(WbD.gapXs)) {
-                    WbPill(statusText, statusColor)
-                    WbPill(if (a.realm == "global") "GLOBAL" else "CN", if (a.realm == "global") WbPalette.info else MiuixTheme.colorScheme.primary)
-                    // 企业版没有个人成长体系（签到等一律被上游拒绝）：标出来，避免被误当成异常。
-                    if (a.enterprise) WbPill("企业版", WbPalette.warn)
+                if (selecting) {
+                    // 选择模式只留一个明确的勾选态，状态徽标收起（否则右侧三列徽标 + 勾选圈挤成一团）。
+                    Box(
+                        Modifier
+                            .size(26.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (selected) MiuixTheme.colorScheme.primary
+                                else MiuixTheme.colorScheme.surfaceContainerHigh,
+                            )
+                            .border(
+                                1.dp,
+                                if (selected) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.dividerLine,
+                                CircleShape,
+                            ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (checkScale > 0.01f) {
+                            top.yukonga.miuix.kmp.basic.Icon(
+                                MiuixIcons.Ok,
+                                contentDescription = null,
+                                tint = MiuixTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(18.dp).graphicsLayer {
+                                    scaleX = checkScale
+                                    scaleY = checkScale
+                                    alpha = checkScale
+                                },
+                            )
+                        }
+                    }
+                } else {
+                    Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(WbD.gapXs)) {
+                        WbPill(statusText, statusColor)
+                        WbPill(if (a.realm == "global") "GLOBAL" else "CN", if (a.realm == "global") WbPalette.info else MiuixTheme.colorScheme.primary)
+                        // 企业版没有个人成长体系（签到等一律被上游拒绝）：标出来，避免被误当成异常。
+                        if (a.enterprise) WbPill("企业版", WbPalette.warn)
+                    }
                 }
             }
             WbRow(
@@ -556,8 +834,8 @@ private fun AccountCard(a: AccountView, onClick: () -> Unit) {
                     a.in_flight > 0 -> "在途 ${a.in_flight}"
                     else -> "近期速率 ${rateText(a)}"
                 },
-                chevron = true,
-                onClick = onClick,
+                chevron = !selecting,
+                onClick = if (selecting) null else onClick,
             )
         }
     }
@@ -598,9 +876,9 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
         else -> WbPalette.ok
     }
     val checkedIn = v.last_checkin_at >= todayStartSec()
-    // 「复制登录凭证」用的剪贴板（与 WbCopyRow 同款：新剪贴板 API 为 suspend，走组合作用域）。
-    val clipboard = LocalClipboard.current
-    val copyScope = rememberCoroutineScope()
+    // 「复制登录凭证」= 敏感内容，统一走 SecretClipboard（会给 ClipDescription 打
+    // EXTRA_IS_SENSITIVE，系统复制预览与输入法剪贴板面板都不显示 access_token 明文）。
+    val ctx = LocalContext.current
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = pageTv,
@@ -762,10 +1040,11 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
                             if (json == null) {
                                 vm.toast("账号不存在，无法复制凭证")
                             } else {
-                                copyScope.launch {
-                                    clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("wb2api-credential", json)))
-                                }
-                                vm.toast("已复制登录凭证到剪贴板，请勿外传")
+                                val ok = SecretClipboard.copySensitive(ctx, json)
+                                vm.toast(
+                                    if (ok) "已复制登录凭证（已标记敏感），请勿外传"
+                                    else "复制失败：剪贴板不可用",
+                                )
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),

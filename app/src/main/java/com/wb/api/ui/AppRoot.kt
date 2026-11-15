@@ -58,6 +58,7 @@ import com.kyant.shapes.RoundedCornerStyle
 import com.kyant.shapes.RoundedRectangle
 import com.wb.api.LoginWebActivity
 import com.wb.api.core.LogBus
+import com.wb.api.core.SecretClipboard
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -68,6 +69,9 @@ import top.yukonga.miuix.kmp.basic.SnackbarHost
 import top.yukonga.miuix.kmp.basic.SnackbarHostState
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
+import top.yukonga.miuix.kmp.icon.extended.FileDownloads
+import top.yukonga.miuix.kmp.icon.extended.Copy
+import top.yukonga.miuix.kmp.icon.extended.Tasks
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Contacts
@@ -608,10 +612,19 @@ private fun AddAccountSheet(
     var fallbackRealm by remember { mutableStateOf("cn") }
     val busy by vm.importBusy.collectAsStateWithLifecycle()
     val report by vm.importReport.collectAsStateWithLifecycle()
+    val pending by vm.importPending.collectAsStateWithLifecycle()
+    val ctx = LocalContext.current
+    // 从系统文件选择器读凭证：OpenMultipleDocuments 支持多选（与上游 2026-11 的
+    // 「多文件导入」一致）。mime 同时给 json / text 与 */*：部分文件管理器对无扩展名的
+    // 导出文件只认 octet-stream，只写 application/json 会把文件灰掉选不中。
+    val pickFiles = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> if (uris.isNotEmpty()) vm.stageFiles(uris) }
     // 每次打开复位（否则会残留上次粘贴的敏感文本 / 导入结果）。
     LaunchedEffect(show) {
         if (show) {
-            mode = "pick"; text = ""; fallbackRealm = "cn"; vm.clearImportReport()
+            mode = "pick"; text = ""; fallbackRealm = "cn"
+            vm.clearImportReport(); vm.clearImportPending()
         }
     }
     OverlayBottomSheet(show = show, title = "添加账号", onDismissRequest = onDismiss) {
@@ -665,9 +678,9 @@ private fun AddAccountSheet(
                 WbTextButton("取消", onClick = onDismiss, modifier = Modifier.fillMaxWidth())
             } else {
                 Text(
-                    "粘贴登录凭证 JSON。最小凭证只需 access_token 与 refresh_token 两项" +
-                        "（uid 会自动换取、域按下方选择兜底）； cockpit tools 导出的完整对象" +
-                        "（单个或数组）同样接受。导入后自动落盘、入池、解除冷却并同步余额。",
+                    "粘贴或从文件导入登录凭证：最小凭证只需 access_token 与 refresh_token" +
+                        "（uid 自动换取、域按下方兜底）；批量导出生成的数组、cockpit 导出的嵌套" +
+                        " / 信封 / 字典形态同样接受。导入后自动落盘、入池、解除冷却并同步余额。",
                     style = MiuixTheme.textStyles.body2,
                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                 )
@@ -676,6 +689,35 @@ private fun AddAccountSheet(
                     body = "access_token / refresh_token 即账号访问权限，粘贴或转存时请确保环境可信。",
                     icon = MiuixIcons.Info,
                 )
+                // 两个来源并列：剪贴板（读时按 text/plain 判定，不碰图片/URI）与文件（可多选）。
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(WbD.gapS)) {
+                    WbButton(
+                        "粘贴剪贴板",
+                        onClick = {
+                            val t = SecretClipboard.readText(ctx)
+                            if (t.isNullOrBlank()) {
+                                vm.toast("剪贴板里没有可用的文本")
+                            } else {
+                                text = t
+                                vm.toast("已读取剪贴板 ${t.length} 个字符，确认后点导入")
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        variant = WbButtonVariant.Tonal,
+                        icon = MiuixIcons.Copy,
+                    )
+                    WbButton(
+                        "选择文件",
+                        onClick = {
+                            runCatching {
+                                pickFiles.launch(arrayOf("application/json", "text/plain", "*/*"))
+                            }.onFailure { vm.toast("无法打开文件选择器：${it.message}") }
+                        },
+                        modifier = Modifier.weight(1f),
+                        variant = WbButtonVariant.Tonal,
+                        icon = MiuixIcons.FileDownloads,
+                    )
+                }
                 TextField(
                     value = text,
                     onValueChange = { text = it },
@@ -684,6 +726,33 @@ private fun AddAccountSheet(
                     // （实测「按钮挤出屏幕外、点不到」）。超出部分在框内滚动。
                     modifier = Modifier.fillMaxWidth().heightIn(max = 168.dp),
                 )
+                // 文件预览：选中即读文本并本地预解析，**用户确认后才写入**（误选文件不会静默覆盖账号）。
+                pending?.let { p ->
+                    WbHintBlock(
+                        title = if (p.accountCount > 0) {
+                            "已读取 ${p.names.size} 个文件、${p.accountCount} 条账号"
+                        } else {
+                            "未解析到账号"
+                        },
+                        body = buildString {
+                            if (p.names.isNotEmpty()) append(p.names.joinToString("\n"))
+                            if (p.errors.isNotEmpty()) {
+                                if (isNotEmpty()) append("\n")
+                                append(p.errors.take(10).joinToString("\n"))
+                            }
+                            if (isNotEmpty()) append("\n确认后才会写入，不会自动覆盖。")
+                        },
+                        icon = MiuixIcons.Tasks,
+                    )
+                    WbButton(
+                        text = if (busy) "导入中…" else "确认导入 ${p.accountCount} 条",
+                        onClick = { vm.importPendingCredentials(fallbackRealm) },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !busy && p.accountCount > 0,
+                        icon = MiuixIcons.Import,
+                    )
+                    WbTextButton("清除已选文件", onClick = { vm.clearImportPending() }, modifier = Modifier.fillMaxWidth())
+                }
                 Text(
                     "凭证未带 domain 字段时，按此域兜底（最小凭证没带 domain，就按这里选）：",
                     style = MiuixTheme.textStyles.footnote1,
@@ -695,7 +764,7 @@ private fun AddAccountSheet(
                     onSelect = { fallbackRealm = if (it == 0) "cn" else "global" },
                 )
                 WbButton(
-                    text = if (busy) "导入中…" else "导入",
+                    text = if (busy) "导入中…" else "导入粘贴内容",
                     onClick = { vm.importCredentials(text, fallbackRealm) },
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !busy && text.isNotBlank(),

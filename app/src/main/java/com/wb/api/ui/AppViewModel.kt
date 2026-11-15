@@ -507,10 +507,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 企业版门控：上游对企业号拒绝签到（400 code 10001），如实说明而不是报「签到失败」。
         if (a.isEnterprise) return@ioAsync "企业版账号无签到（上游不支持该操作）"
         val r = runCatching { Gateway.upstream.checkin(a) }
-        if (r.isSuccess) {
-            Gateway.pool.markCheckin(uid)
+        val v = r.getOrNull()
+        if (v != null) {
+            // 账号可用 → 解除冷却；但「处理中」不记签到时刻（见 isCheckinDone 注释）。
             Gateway.pool.revive(uid)
-            if (r.getOrNull() == "已签到") "今日已签到（无需重复）" else "签到成功"
+            if (Gateway.upstream.isCheckinDone(v)) Gateway.pool.markCheckin(uid)
+            when (v) {
+                "已签到" -> "今日已签到（无需重复）"
+                "处理中" -> "上游处理中，稍后由巡检自动补签"
+                else -> "签到成功"
+            }
         } else {
             "签到失败：${r.exceptionOrNull()?.message ?: "未知错误"}"
         }
@@ -536,14 +542,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun checkinAll() = ioAsync("全量签到") {
         val accounts = Gateway.store.auths()
         if (accounts.isEmpty()) return@ioAsync "尚未添加账号"
-        var ok = 0; var already = 0; var fail = 0; var skipped = 0
+        var ok = 0; var already = 0; var fail = 0; var skipped = 0; var pending = 0
         accounts.forEach { a ->
             // 企业号跳过（上游不支持），既不计成功也不计失败。
             if (a.isEnterprise) { skipped++; return@forEach }
             runCatching { Gateway.upstream.checkin(a) }
                 .onSuccess { v ->
-                    Gateway.pool.markCheckin(a.uid)
-                    if (v == "已签到") already++ else ok++
+                    when {
+                        // 处理中：不记签到时刻，计入「待补签」而不是失败/成功。
+                        v == "处理中" -> pending++
+                        Gateway.upstream.isCheckinDone(v) -> {
+                            Gateway.pool.markCheckin(a.uid)
+                            if (v == "已签到") already++ else ok++
+                        }
+                        else -> ok++
+                    }
                 }
                 .onFailure {
                     fail++
@@ -553,6 +566,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         buildString {
             append("成功 $ok")
             if (already > 0) append("，今日已签到 $already")
+            if (pending > 0) append("，上游处理中 $pending（稍后补签）")
             if (skipped > 0) append("，企业版跳过 $skipped")
             if (fail > 0) append("，失败 $fail")
         }
@@ -637,6 +651,114 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _importReport = MutableStateFlow<ImportReport?>(null)
     val importReport: StateFlow<ImportReport?> = _importReport
 
+    /**
+     * 从文件选择、**尚未写入**的导入内容（先预览、确认再导入）。
+     *
+     * 为什么要有这一层：导入会覆盖同名账号的凭证（等于换掉账号身份），误选一个文件就静默
+     * 覆盖是不可接受的。上游 2026-11 的 panel 也改成了「选中先 dryRun 预览、确认再写入」。
+     */
+    data class ImportPending(
+        val names: List<String>,
+        val texts: List<String>,
+        /** 本地预解析出的账号条数（不联网、不写盘）。 */
+        val accountCount: Int,
+        val errors: List<String> = emptyList(),
+    )
+
+    private val _importPending = MutableStateFlow<ImportPending?>(null)
+    val importPending: StateFlow<ImportPending?> = _importPending
+
+    fun clearImportPending() { _importPending.value = null }
+
+    /**
+     * 读取用户通过 SAF 选中的文件（可多选），暂存为待导入内容。
+     *
+     * 只做「读文本 + 本地预解析」：不联网换 uid、不写盘、不动号池 —— 预览阶段必须无副作用。
+     * 单文件上限 [MAX_IMPORT_BYTES]：凭证 JSON 实际只有几 KB，超过上限几乎一定是选错文件，
+     * 与其读到 OOM 不如明确拒绝。
+     */
+    fun stageFiles(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ctx = getApplication<Application>()
+            val names = ArrayList<String>()
+            val texts = ArrayList<String>()
+            val errors = ArrayList<String>()
+            for (u in uris) {
+                val nm = queryDisplayName(ctx, u) ?: u.lastPathSegment ?: "未命名文件"
+                val t = runCatching { readTextLimited(ctx, u) }.getOrElse { e ->
+                    errors += "$nm：读取失败（${e.message ?: "无法打开"}）"
+                    null
+                }
+                if (t.isNullOrBlank()) {
+                    if (errors.none { it.startsWith("$nm：") }) errors += "$nm：文件为空"
+                    continue
+                }
+                // 预解析只统计条数，并提前暴露「不是合法 JSON」——避免用户在导入后才发现白选。
+                runCatching { CredentialTransfer.parseRows(t).size }
+                    .onSuccess { names += nm; texts += t }
+                    .onFailure { errors += "$nm：${it.message ?: "格式不符"}" }
+            }
+            val count = texts.sumOf { t -> runCatching { CredentialTransfer.parseRows(t).size }.getOrDefault(0) }
+            _importPending.value = ImportPending(names, texts, count, errors)
+            toast(
+                when {
+                    count > 0 -> "已读取 ${names.size} 个文件、$count 条账号，确认后导入"
+                    else -> "未解析到账号" + (errors.firstOrNull()?.let { "：$it" } ?: "")
+                },
+            )
+        }
+    }
+
+    /** 把已暂存的文件内容真正导入（用户点了「确认导入」）。 */
+    fun importPendingCredentials(fallbackRealm: String) {
+        // 先判忙再清 pending：反过来会「清掉了暂存内容，但导入被忙标记拒绝」——
+        // 用户看到的是「点了确认什么也没发生」，且要重新选文件。
+        if (_importBusy.value) {
+            toast("正在导入，请稍候")
+            return
+        }
+        val p = _importPending.value ?: return
+        if (p.texts.isEmpty()) return
+        _importPending.value = null
+        importCredentialsFrom(p.texts, fallbackRealm)
+    }
+
+    private fun queryDisplayName(ctx: android.content.Context, uri: android.net.Uri): String? =
+        runCatching {
+            ctx.contentResolver.query(
+                uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null,
+            )?.use { c -> if (c.moveToFirst() && c.columnCount > 0) c.getString(0) else null }
+        }.getOrNull()
+
+    /**
+     * 按字符流读文本并限制总长度。
+     *
+     * 不用 `InputStream.readNBytes`：它是 Java 9 API，minSdk 32 上不可用（编译期就会报错）。
+     * 也不整份 `readText()`：那会把任意大的文件一次读进内存。
+     */
+    private fun readTextLimited(ctx: android.content.Context, uri: android.net.Uri): String {
+        ctx.contentResolver.openInputStream(uri)?.use { ins ->
+            val sb = StringBuilder()
+            ins.bufferedReader(Charsets.UTF_8).use { br ->
+                val buf = CharArray(8192)
+                var total = 0
+                while (true) {
+                    val n = br.read(buf)
+                    if (n < 0) break
+                    total += n
+                    if (total > MAX_IMPORT_BYTES) {
+                        throw java.io.IOException("文件超过 ${MAX_IMPORT_BYTES / 1024 / 1024}M 字符")
+                    }
+                    sb.append(buf, 0, n)
+                }
+            }
+            return sb.toString()
+        }
+        throw java.io.IOException("无法打开文件")
+    }
+
+
     /** 关闭「添加账号」弹层时清掉上一次的导入结果，避免下次打开残留。 */
     fun clearImportReport() { _importReport.value = null }
 
@@ -647,12 +769,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * → 解除冷却（pool.Revive），最后汇总 `{ok,total,imported,skipped,errors}`。
      * 解析失败（JSON 非法 / 空数组）时把 ok=false、原因放进 errors。
      */
-    fun importCredentials(raw: String, fallbackRealm: String) {
+    fun importCredentials(raw: String, fallbackRealm: String) =
+        importCredentialsFrom(listOf(raw), fallbackRealm)
+
+    /**
+     * 从**多份**文本导入（多选文件 / 文件 + 粘贴混用）。
+     *
+     * 与单份导入的区别只在「解析阶段」：某一份不是合法 JSON 只记一条 error，不拖垮其余文件
+     * —— 导入本来就是逐条容错（skipped），这里保持同一语义，避免「一个文件坏掉整体失败」。
+     */
+    fun importCredentialsFrom(texts: List<String>, fallbackRealm: String) {
+        // 忙标记必须在 launch 之前置位：写在协程体内时，连点 / 「粘贴 + 文件」两路都能
+        // 穿过检查，同一批凭证会被落盘两次（重复签到、重复刷余额、统计错乱）。
         if (_importBusy.value) return
+        _importBusy.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            _importBusy.value = true
             _importReport.value = null
-            val report = runCatching { importBlocking(raw, fallbackRealm) }
+            val report = runCatching { importBlockingFrom(texts, fallbackRealm) }
                 .getOrElse {
                     ImportReport(false, 0, 0, 0, listOf(it.message ?: "导入失败"))
                 }
@@ -665,11 +798,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun importBlocking(raw: String, fallbackRealm: String): ImportReport {
-        val rows = CredentialTransfer.parseRows(raw) // 非法 JSON / 空数组在此抛出
+    private suspend fun importBlocking(raw: String, fallbackRealm: String): ImportReport =
+        importBlockingFrom(listOf(raw), fallbackRealm)
+
+    private suspend fun importBlockingFrom(texts: List<String>, fallbackRealm: String): ImportReport {
         val errors = ArrayList<String>()
+        val rows = ArrayList<kotlinx.serialization.json.JsonObject>()
+        texts.forEachIndexed { i, t ->
+            runCatching { CredentialTransfer.parseRows(t) }
+                .onSuccess { rows += it }
+                .onFailure { e ->
+                    errors += if (texts.size > 1) {
+                        "第 ${i + 1} 份内容解析失败：${e.message ?: "格式不符"}"
+                    } else {
+                        e.message ?: "解析失败"
+                    }
+                }
+        }
+        // 一份都解析不出来：什么都不写，直接判失败 —— 不能出现「报告成功但实际没导入」。
+        if (rows.isEmpty()) return ImportReport(false, 0, 0, 0, errors)
         var imported = 0
         var skipped = 0
+        var overwrites = 0
+        // 批内 uid 去重（对齐上游 seenUID：同一批里同一账号只处理一次，其余计 skipped）。
+        val seen = HashSet<String>()
         for (obj in rows) {
             // parseRows 返回原始对象列表（对齐 import.go:62-66 的 json.Unmarshal）；buildRow 承担
             // 「必填校验 + 字段映射」（对齐 import.go:75-112）。
@@ -693,21 +845,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         if (row.id.isNotEmpty()) "（id=${row.id}）" else ""
                 }
                 is CredentialTransfer.Row.Ready -> {
+                    if (!seen.add(row.entry.uid)) {
+                        skipped++
+                        errors += "跳过：同一批内重复账号（uid=${row.entry.uid}）"
+                        continue
+                    }
                     var entry = row.entry
+                    // 覆盖判定必须取「导入前」的快照（saveAuth 之后恒为 true，会全记成覆盖）。
+                    val replacing = Gateway.store.getAuth(entry.uid) != null
                     // 顺带用 Bearer 校验一次、补全 uid/nickname；**失败绝不阻断导入**
                     // （对齐 import.go:133「失败仅记日志」）。
                     runCatching { fetchAndEnrich(entry) }
                         .onSuccess { enriched -> if (enriched != null) entry = enriched }
                         .onFailure { LogBus.log("[导入] Bearer 校验失败 uid=${entry.uid}: ${it.message}") }
+                    // ① 落盘是唯一「必修项」：它失败才算 skipped。
+                    val saved = runCatching { Gateway.store.saveAuth(entry) }
+                        .onFailure {
+                            skipped++
+                            errors += "uid=${entry.uid}: 落盘失败：${it.message}"
+                        }.isSuccess
+                    if (!saved) continue
+                    // ② 落盘成功后的副作用（入池 / 签到 / 余额）失败只记日志 —— 绝不能把
+                    //    「已经写进磁盘的账号」再计成 skipped（否则报告与磁盘互相矛盾）。
                     runCatching {
-                        Gateway.store.saveAuth(entry)   // 落盘（对齐 import.go:124 SaveAtomic）
                         Gateway.pool.reload()            // 入池（对齐 import.go:130 pool.Add）
                         Gateway.pool.revive(entry.uid)   // 解除冷却/熔断（对齐 import.go:131 pool.Revive）
                         // 顺带签到（幂等；失败仅记日志，不阻断）——对齐 import.go:145-149。
                         // global 域在本项目无 GlobalCompleteRegistration / ClaimTrial 等价实现，跳过。
                         if (entry.realm != "global" && !entry.isEnterprise) {
                             runCatching { Gateway.upstream.checkin(entry) }
-                                .onSuccess { Gateway.pool.markCheckin(entry.uid) }
+                                // 「处理中」不是终态，不能记签到时刻（否则今天不会再补签）。
+                                .onSuccess { r -> if (r == "ok" || r == "已签到") Gateway.pool.markCheckin(entry.uid) }
                                 .onFailure { LogBus.log("[导入] 签到 uid=${entry.uid}: ${it.message}") }
                         }
                         // 同步余额：**与 OAuth 登录路径逐行一致**（见 LoginWebActivity 的
@@ -722,16 +890,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             .onFailure { LogBus.log("[导入] 余额 uid=${entry.uid}: ${it.message}") }
                         Gateway.pool.reload()
-                        imported++
                     }.onFailure {
-                        skipped++
-                        errors += "uid=${entry.uid}: 落盘失败：${it.message}"
+                        LogBus.log("[导入] 后置动作失败 uid=${entry.uid}: ${it.message}")
                     }
+                    if (replacing) overwrites++
+                    imported++
                 }
             }
         }
-        LogBus.log("[导入] cockpit 导入完成 total=${rows.size} imported=$imported skipped=$skipped")
-        return ImportReport(true, rows.size, imported, skipped, errors)
+        LogBus.log("[导入] 完成 total=${rows.size} imported=$imported overwrites=$overwrites skipped=$skipped")
+        return ImportReport(true, rows.size, imported, skipped, errors, overwrites)
     }
 
     /**
@@ -792,6 +960,45 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun credentialJson(uid: String): String? =
         Gateway.store.getAuth(uid)?.let { CredentialTransfer.encode(it) }
+
+    /**
+     * 多账号批量导出（JSON 数组，带 uid/nickname/domain/expires_at 元数据）。
+     *
+     * @param uids 选中的 uid；不存在的 uid 静默跳过（列表刷新后可能已被移除）。
+     * @return null 表示一个有效账号都没有（调用方提示而不是导出空数组）。
+     */
+    fun credentialJsonBulk(uids: Collection<String>): String? {
+        val entries = uids.mapNotNull { Gateway.store.getAuth(it) }
+        if (entries.isEmpty()) return null
+        return CredentialTransfer.encodeBulk(entries)
+    }
+
+    /** 批量导出建议文件名（SAF 预填）。 */
+    fun credentialFileName(prefix: String = "wb2api-credentials"): String =
+        CredentialTransfer.suggestFileName(prefix)
+
+    /**
+     * 把文本写入用户通过 SAF 选定的位置（导出文件）。
+     *
+     * 用 `"wt"` 模式：用户选择「替换已有文件」时**必须截断**，否则新内容比旧文件短会留下旧尾巴，
+     * 下次导入解析直接失败（典型的「看着导出成功、导入报错」）。
+     */
+    fun exportCredentialsToFile(uri: android.net.Uri, text: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val ctx = getApplication<Application>()
+            val ok = runCatching {
+                ctx.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                } ?: return@runCatching false
+                true
+            }.getOrElse { e ->
+                LogBus.log("[导出] 写入失败：${e.message}")
+                false
+            }
+            toast(if (ok) "已导出 ${text.length} 个字符到所选位置" else "导出失败，请重试或换一个位置")
+        }
+    }
 
     // ---------- 请求归档 ----------
 
@@ -905,3 +1112,6 @@ data class ArchiveStats(
     val bytes: Long = 0,
     val updatedAt: Long = 0,
 )
+
+/** 单文件导入上限（字符数）：凭证 JSON 实际只有几 KB，超出几乎一定是选错文件。 */
+private const val MAX_IMPORT_BYTES = 4 * 1024 * 1024
