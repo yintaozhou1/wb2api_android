@@ -121,11 +121,19 @@ object Rewrite {
         // 6.1) 输出预算下限：档位确定之后再抬（依赖最终 reasoning_effort）。
         applyOutputFloor(obj, maxOutput, defaultEfforts[modelName] ?: "", thinkingActive, effortOff)
         backfillReasoningContent(obj)
+        // 6.2) Kimi / GLM 等按 `reasoning` 字段读历史思考，而 OpenAI 系客户端只发
+        //      `reasoning_content`：只镜像、不新建、不覆盖已有值（上游 reasoning_mirror.go）。
+        mirrorReasoning(obj, modelName)
 
         // 7) 指纹脱敏（开关）。
         if (sanitize) {
             for (k in fingerprintKeys) obj.remove(k)
         }
+
+        // 8) 出站补位空 text 段（上游 empty_text_part.go）：上游对 `text` 为 ""/null/缺失的
+        //    text 段直接判 400 code=11151（a message has empty content）。补一个空格即可，
+        //    且**只补值不删段** —— 删段会改变段序与下标，反而让多图消息错位。
+        fillEmptyTextParts(obj)
 
         return obj.toJsonObject()
     }
@@ -732,6 +740,56 @@ object Rewrite {
         if (best.isNotEmpty() && best != obj[key]) obj[key] = best
     }
 
+    /** 上游按 `reasoning` 读历史思考的模型前缀（与 upstream/reasoning_mirror.go 同表）。 */
+    private val reasoningMirrorPrefixes = listOf("kimi", "glm", "minimax", "mimo", "step", "space-bunny")
+
+    /**
+     * 把 assistant 消息的 `reasoning_content` 镜像到 `reasoning`（仅上述模型家族）。
+     *
+     * 为什么需要：这些上游读 `reasoning` 字段续接思考，客户端却只发 `reasoning_content`，
+     * 于是多轮对话里模型看不到自己上一轮想过什么，表现为「重复推理、上下文断层」。
+     * 只在目标字段为空时写，已有非空值绝不覆盖（客户端可能两个都发了）。
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun mirrorReasoning(obj: MutableMap<String, Any?>, model: String) {
+        val m = model.lowercase()
+        if (reasoningMirrorPrefixes.none { m.startsWith(it) }) return
+        val msgs = obj["messages"] as? List<*> ?: return
+        for (raw in msgs) {
+            val msg = raw as? MutableMap<String, Any?> ?: continue
+            if (msg["role"] != "assistant") continue
+            val rc = msg["reasoning_content"] as? String
+            if (rc.isNullOrEmpty()) continue
+            val cur = msg["reasoning"]
+            if (cur is String && cur.isNotEmpty()) continue
+            msg["reasoning"] = rc
+        }
+    }
+
+    /**
+     * 补位空 text 段（上游对空内容判 11151，直接 400）。
+     *
+     * 实测口径（upstream/empty_text_part.go）：`text:""` / `text:null` / 缺 `text` → 400；
+     * `text:"   "` → 200。因此只把「非非空字符串」补成一个空格；`type` 不是 text 的段
+     * （image_url / input_image 等）与字符串形态的 content 一律不动。
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun fillEmptyTextParts(obj: MutableMap<String, Any?>) {
+        val msgs = obj["messages"] as? List<*> ?: return
+        for (raw in msgs) {
+            val msg = raw as? MutableMap<String, Any?> ?: continue
+            val content = msg["content"] as? MutableList<Any?> ?: continue
+            for (p in content) {
+                val part = p as? MutableMap<String, Any?> ?: continue
+                val type = part["type"] as? String
+                if (type != null && type != "text") continue
+                val t = part["text"]
+                if (t is String && t.isNotEmpty()) continue
+                part["text"] = " "
+            }
+        }
+    }
+
     private fun backfillReasoningContent(obj: MutableMap<String, Any?>) {
         val model = obj["model"] as? String ?: return
         if (!isDeepSeekModel(model)) return
@@ -779,6 +837,10 @@ object Rewrite {
     fun deriveSessionKey(body: JsonObject): String? {
         val msgs = body["messages"] as? JsonArray ?: return null
         val sb = StringBuilder()
+        // 把调用方标识掺进哈希（上游 session.go 的 callerID 同口径）：只按内容派生时，
+        // 两个用户发出**完全相同**的第一条消息会算出同一个键、互相粘到同一个账号上。
+        val caller = body["user_id"]?.primText() ?: body["user"]?.primText() ?: ""
+        if (caller.isNotEmpty()) sb.append("caller:").append(caller).append('|')
         var firstUserTaken = false
         for (m in msgs) {
             val obj = runCatching { m.jsonObject }.getOrNull() ?: continue

@@ -17,6 +17,8 @@ import com.wb.api.upstream.SessionVerdict
 import com.wb.api.upstream.Dsml
 import com.wb.api.upstream.ErrKind
 import com.wb.api.upstream.Rewrite
+import com.wb.api.upstream.SseSplit
+import com.wb.api.upstream.ThinkTag
 import com.wb.api.upstream.UpstreamException
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
@@ -331,9 +333,13 @@ object ChatHandler {
                         val kind = Classify.of(resp.code, text)
                         lastKind = kind; lastBody = text
                         noteError(auth, kind, resp.code, model, text, retryAfter)
+                        // 请求级错误（参数非法 / 内容被拦 / 提示词过长 / 图片不合法）与账号无关：
+                        // 换号必然同样被拒，而且**绝不能解绑会话粘性** —— 解绑后下一次请求会选到
+                        // 另一个账号，上游前缀缓存全量 miss（「报错一次，缓存就再也不生效」，
+                        // 上游 2026-11 的修复口径）。这类错误直接按原状态码回给客户端。
+                        if (kind in failFastKinds) { mapError(res, kind, lastBody, model, false, realm); return }
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
                         LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
-                        if (kind in failFastKinds) { mapError(res, kind, lastBody, model, false, realm); return }
                         // 6020 带 data.retry_after（实测 40s，通道级口径：队列按 client_user_type
                         // 全局共享）时**不再换号**：上游已给出「N 秒后重试」，这几毫秒内换号必然撞
                         // 同一堵墙，只是把同一份排队请求多发 MAX_ROTATE 次（上游 issue #125）。
@@ -567,6 +573,35 @@ object ChatHandler {
         })
     }
 
+    /** 在 delta 上追加 `reasoning_content`（思考标签拆出来的内容），保留既有思考前缀。 */
+    private fun injectReasoning(el: JsonObject, thinking: String): JsonObject {
+        if (thinking.isEmpty()) return el
+        val choices = el["choices"] as? JsonArray ?: return el
+        return JsonObject(el.toMutableMap().apply {
+            put("choices", JsonArray(choices.map { c ->
+                val o = c as? JsonObject ?: return@map c
+                val d = o["delta"] as? JsonObject ?: buildJsonObject { }
+                val prev = d["reasoning_content"]?.primText().orEmpty()
+                JsonObject(o.toMutableMap().apply {
+                    put("delta", JsonObject(d.toMutableMap().apply {
+                        put("reasoning_content", JsonPrimitive(prev + thinking))
+                    }))
+                })
+            }))
+        })
+    }
+
+    /** 只携带 reasoning_content 的增量帧（思考尾巴收尾用）。 */
+    private fun reasoningFrame(text: String): JsonObject = buildJsonObject {
+        put("choices", buildJsonArray {
+            add(buildJsonObject {
+                put("index", JsonPrimitive(0))
+                put("delta", buildJsonObject { put("reasoning_content", JsonPrimitive(text)) })
+                put("finish_reason", JsonNull)
+            })
+        })
+    }
+
     /** 把某个 delta 帧的 `content` 替换成修复后的文本（无 content 键则原样返回）。 */
     private fun rewriteContent(el: JsonObject, text: String): JsonObject {
         val choices = el["choices"] as? JsonArray ?: return el
@@ -619,6 +654,9 @@ object ChatHandler {
         var errFrame: String? = null
         var usage = Tokens()
         var sawDone = false
+        // 收到 error / 内嵌失败帧后必须**终止读流**：上游在 200 流里插一条失败帧后仍可能
+        // 继续发正文，继续转发会让客户端同时拿到「错误」和「内容」，且终态帧被跳过。
+        var errAbort = false
         // tool_call 的 name 收敛（与官方 OpenAI 流、Go stripToolCallNames 一致）：
         // 同一 index 只有首片保留 function.name，后续分片删除该键。
         val seenToolNames = HashSet<String>()
@@ -637,6 +675,8 @@ object ChatHandler {
         // 生产路径恒开启 allowUnknown=true：tools 声明在中转环节丢失是常态，此时只能靠
         // 「块结构完美 + 工具名形如标识符」弱判定兜底。
         val repair = Dsml.Repair(allowedTools, allowUnknown = true)
+        // 思考标签拆分器（issue #194）：把混进正文的 <think:SUF> 还原成 reasoning_content。
+        val thinkTag = ThinkTag()
         var pendingFinish: String? = null
         var sawFinish = false
         var markupCalls = 0
@@ -712,57 +752,72 @@ object ChatHandler {
                     sawDone = true
                     break
                 }
-                val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
-                // 内嵌失败帧：上游把 11140 / 6004 这类失败塞在 SSE **顶层** {code,msg}，
-                // 必须先归一成标准 error 帧，否则白名单会剥掉 code/msg、客户端只看到
-                // 「干净地停下、无任何失败」。
-                val embedded = embeddedErrorPayload(el)
-                val effectivePayload = embedded ?: payload
-                val isErr = embedded != null || el.containsKey("error")
-                if (!started) {
-                    // 首帧即失败：还没向客户端写任何字节 → 无痕换号重试（head veto）。
-                    if (isErr) {
-                        val kind = Classify.frame(effectivePayload)
-                        noteError(auth, kind, 200, model, effectivePayload)
-                        LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 首帧 error/内嵌失败 kind=$kind -> 换号重试")
-                        return Hop(
-                            ok = false, sent = false,
-                            errKind = kind, errStatus = 200, errBody = effectivePayload,
-                        )
+                // 一行多 JSON（上游 issue #197）：先尝试整行解析，解析失败才按「顶层值边界」
+                // 拆成多帧，每帧当独立事件处理。拆不出来时返回空列表 —— 与原行为一致：跳过该帧。
+                // 不处理它的后果是**整块被客户端丢弃**（按空行切帧后不是以 data: 开头），
+                // 表现为「偶发丢字 / 工具调用消失」。
+                for ((payloadOne, el) in SseSplit.splitFrames(payload)) {
+                    // 内嵌失败帧：上游把 11140 / 6004 这类失败塞在 SSE **顶层** {code,msg}，
+                    // 必须先归一成标准 error 帧，否则白名单会剥掉 code/msg、客户端只看到
+                    // 「干净地停下、无任何失败」。
+                    val embedded = embeddedErrorPayload(el)
+                    val effectivePayload = embedded ?: payloadOne
+                    val isErr = embedded != null || el.containsKey("error")
+                    if (!started) {
+                        // 首帧即失败：还没向客户端写任何字节 → 无痕换号重试（head veto）。
+                        if (isErr) {
+                            val kind = Classify.frame(effectivePayload)
+                            noteError(auth, kind, 200, model, effectivePayload)
+                            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 首帧 error/内嵌失败 kind=$kind -> 换号重试")
+                            return Hop(
+                                ok = false, sent = false,
+                                errKind = kind, errStatus = 200, errBody = effectivePayload,
+                            )
+                        }
+                        beginOnce()
                     }
-                    beginOnce()
+                    if (isErr) {
+                        errFrame = effectivePayload
+                        res.chunk("data: $effectivePayload\n\n")
+                        errAbort = true
+                        break
+                    }
+                    usage = usage.merge(el)
+                    // 先记下上游 id：emitCalls 合成 tool_calls 帧时要立刻用到它，
+                    // 否则「首帧即标记」的流会先发一个 chatcmpl-wb2api 的帧、再发真实 id 的帧，
+                    // 按 id 归并的客户端会把一条流拆成两段。
+                    if (firstId == null) el["id"]?.primText()?.takeIf { it.isNotBlank() }?.let { firstId = it }
+                    val ch = (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()
+                    ch?.get("finish_reason")?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
+                        sawFinish = true
+                        pendingFinish = it
+                    }
+                    // 正文过 DSML 修复器：命中标记时暂扣正文、还原成 tool_calls 帧。
+                    val piece = (ch?.get("delta") as? JsonObject)?.get("content")?.primText()
+                    var frameEl = el
+                    if (piece != null) {
+                        // 先拆思考标签，再把剩下的正文交给 DSML 修复器：DSML 只认正文标记，
+                        // 思考里出现的同名标记不该被当成一次工具调用。
+                        val (thinking, bodyText) = thinkTag.feed(piece)
+                        if (thinking.isNotEmpty()) frameEl = injectReasoning(frameEl, thinking)
+                        val fed = repair.feed(bodyText)
+                        emitCalls(fed.second)
+                        frameEl = rewriteContent(frameEl, fed.first)
+                    }
+                    // 记录本帧真实调用的 index（在 emitCalls 之后更新，与上游 writeChunk 的时序一致）
+                    ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.let { arr ->
+                        if (arr.isNotEmpty()) sawToolCall = true
+                    }
+                    ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.forEach { t ->
+                        t.objOrNull()?.get("index")?.primText()?.toIntOrNull()?.let { if (it > maxToolIdx) maxToolIdx = it }
+                    }
+                    val norm = normalizeFrame(frameEl, firstId, seenToolNames)
+                    firstId = norm.first
+                    // finish_reason 先扣住：若后面还还原出调用，要改写成 tool_calls 再下发。
+                    val forwarded = if (ch?.get("finish_reason") != null) stripFinishReason(norm.second) else norm.second
+                    res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), forwarded)}\n\n")
                 }
-                if (isErr) {
-                    errFrame = effectivePayload
-                    res.chunk("data: $effectivePayload\n\n")
-                    continue
-                }
-                usage = usage.merge(el)
-                val ch = (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()
-                ch?.get("finish_reason")?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
-                    sawFinish = true
-                    pendingFinish = it
-                }
-                // 正文过 DSML 修复器：命中标记时暂扣正文、还原成 tool_calls 帧。
-                val piece = (ch?.get("delta") as? JsonObject)?.get("content")?.primText()
-                var frameEl = el
-                if (piece != null) {
-                    val fed = repair.feed(piece)
-                    emitCalls(fed.second)
-                    frameEl = rewriteContent(el, fed.first)
-                }
-                // 记录本帧真实调用的 index（在 emitCalls 之后更新，与上游 writeChunk 的时序一致）
-                ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.let { arr ->
-                    if (arr.isNotEmpty()) sawToolCall = true
-                }
-                ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.forEach { t ->
-                    t.objOrNull()?.get("index")?.primText()?.toIntOrNull()?.let { if (it > maxToolIdx) maxToolIdx = it }
-                }
-                val norm = normalizeFrame(frameEl, firstId, seenToolNames)
-                firstId = norm.first
-                // finish_reason 先扣住：若后面还还原出调用，要改写成 tool_calls 再下发。
-                val forwarded = if (ch?.get("finish_reason") != null) stripFinishReason(norm.second) else norm.second
-                res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), forwarded)}\n\n")
+                if (errAbort) break
             }
             if (!started) {
                 // 整个流没有任何 data 帧（上游空流 / 首帧前断开）→ 无痕，换号重试
@@ -773,8 +828,21 @@ object ChatHandler {
                 )
             }
             if (errFrame == null) {
-                // 收尾：吐出修复器里暂扣的尾部正文（未命中标记时就是原样）。
-                val tail = repair.flush()
+                // 收尾：先把思考标签缓冲的尾巴吐出来（未闭合标签按正文处理），
+                // 再吐修复器里暂扣的尾部正文。
+                val (thinkTail, bodyTail) = thinkTag.flush()
+                if (thinkTail.isNotEmpty()) {
+                    val tn = normalizeFrame(reasoningFrame(thinkTail), firstId, seenToolNames)
+                    firstId = tn.first
+                    res.chunk("data: ${AppJson.encodeToString(JsonObject.serializer(), tn.second)}\n\n")
+                }
+                val tail = if (bodyTail.isEmpty()) {
+                    repair.flush()
+                } else {
+                    val f = repair.feed(bodyTail)
+                    emitCalls(f.second)
+                    f.first + repair.flush()
+                }
                 if (tail.isNotEmpty()) {
                     val norm = normalizeFrame(contentFrame(tail), firstId, seenToolNames)
                     firstId = norm.first
@@ -877,25 +945,31 @@ object ChatHandler {
                 if (!line.startsWith("data:")) continue
                 val payload = line.substring(5).trim()
                 if (payload == "[DONE]") { sawDone = true; break }
-                val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
-                // 内嵌失败帧（顶层 code/msg、无 choices、无 error）：上游把 11140 / 6004 /
-                // 11-128 这类失败塞在 HTTP 200 的流里。不识别它的后果是**静默成功**——本循环
-                // 跳过无 choices 的帧，最后 content 为空、finish 保持 "stop"，客户端拿到一个
-                // 「成功但什么都没有」的响应，账号也不被处置。必须先归一成标准 error 帧。
-                embeddedErrorPayload(el)?.let { errFrame = it; break }
-                if (el.containsKey("error")) { errFrame = payload; break }
-                el["id"]?.primText()?.let { if (it.isNotBlank()) id = it }
-                usage = usage.merge(el)
-                (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()?.let { ch ->
-                    val delta = ch["delta"]?.objOrNull()
-                    delta?.get("content")?.primText()?.let { content.append(it) }
-                    delta?.get("reasoning_content")?.primText()?.let { reasoning.append(it) }
-                    collectToolCalls(delta, toolCalls)
-                    ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
-                        finish = it
-                        sawFinish = true
+                // 一行多 JSON（issue #197）：整行能解析就用整行，否则按顶层值边界拆开逐个并入。
+                // 非流式同样要拆 —— 否则半条事件的 usage / tool_calls 会静默丢失。
+                val frames = SseSplit.splitFrames(payload)
+                var stop = false
+                for ((p, el) in frames) {
+                    // 内嵌失败帧（顶层 code/msg、无 choices、无 error）：上游把 11140 / 6004 /
+                    // 11-128 这类失败塞在 HTTP 200 的流里。不识别它的后果是**静默成功**——本循环
+                    // 跳过无 choices 的帧，最后 content 为空、finish 保持 "stop"，客户端拿到一个
+                    // 「成功但什么都没有」的响应，账号也不被处置。必须先归一成标准 error 帧。
+                    embeddedErrorPayload(el)?.let { errFrame = it; stop = true; break }
+                    if (el.containsKey("error")) { errFrame = p; stop = true; break }
+                    el["id"]?.primText()?.let { if (it.isNotBlank()) id = it }
+                    usage = usage.merge(el)
+                    (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()?.let { ch ->
+                        val delta = ch["delta"]?.objOrNull()
+                        delta?.get("content")?.primText()?.let { content.append(it) }
+                        delta?.get("reasoning_content")?.primText()?.let { reasoning.append(it) }
+                        collectToolCalls(delta, toolCalls)
+                        ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let {
+                            finish = it
+                            sawFinish = true
+                        }
                     }
                 }
+                if (stop) break
             }
         } finally { runCatching { reader.close() } }
 
@@ -913,6 +987,19 @@ object ChatHandler {
             return Hop(ok = false, sent = true)
         }
 
+        // 正文里的 <think:SUF> 拆回 thinking（issue #194）：这类标签是上游把思考串漏进
+        // content 的产物，客户端会把它们当正文渲染出来。
+        run {
+            val raw = content.toString()
+            val (tk, bodyText) = ThinkTag.splitFull(raw)
+            // 判据用「正文是否变化」而不是「thinking 是否非空」：`<think:X></think:X>正文`
+            // 这种空思考段会让 thinking 为空，但标签仍必须从正文里拿掉。
+            if (bodyText != raw) {
+                if (tk.isNotEmpty()) reasoning.append(tk)
+                content.setLength(0)
+                content.append(bodyText)
+            }
+        }
         // 断流如实上报：既无 finish_reason 也无 [DONE] 就 EOF → 标 length（新上游同口径）。
         if (!sawDone && !sawFinish) finish = "length"
         // DSML 还原（非流式）：本回合没有结构化 tool_calls、正常 stop、正文含标记时，把标记
@@ -1983,12 +2070,26 @@ object ChatHandler {
             var sawDone = false
             val reader = BufferedReader(InputStreamReader(bodyStreamOf(resp)))
             try {
+                // 一行多 JSON（issue #197）：整行解析失败时按顶层边界拆开、用队列逐条回放。
+                // 这样后续处理代码一行都不用改（break/continue 的语义与原实现完全一致）。
+                val pendingParts = ArrayList<String>()
                 while (true) {
-                    val line = reader.readLine() ?: break
-                    if (!line.startsWith("data:")) continue
-                    val payload = line.substring(5).trim()
+                    val payload: String
+                    if (pendingParts.isNotEmpty()) {
+                        payload = pendingParts.removeAt(0)
+                    } else {
+                        val line = reader.readLine() ?: break
+                        if (!line.startsWith("data:")) continue
+                        payload = line.substring(5).trim()
+                    }
                     if (payload == "[DONE]") { sawDone = true; break }
-                    val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
+                    val direct = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull()
+                    if (direct == null) {
+                        val parts = SseSplit.scan(payload)
+                        if (parts.size > 1) pendingParts.addAll(parts)
+                        continue
+                    }
+                    val el = direct
                     // 内嵌失败帧（顶层 code/msg、无 choices）：先归一成标准 error 帧再判。
                     val embedded = embeddedErrorPayload(el)
                     if (embedded != null) { errFrame = embedded; break }
