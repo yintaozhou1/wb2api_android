@@ -68,19 +68,97 @@ object CredentialTransfer {
      * 本实现对「单个对象」也宽容接受（便于从账号详情页复制单条后原样粘回），
      * 其余形态（数字 / 字符串 / 空数组）一律按上游口径判为非法。
      */
-    fun parseRows(raw: String): List<JsonObject> {
+    fun parseRows(raw: String): List<JsonObject> = decodeObjects(raw)
+
+    /**
+     * 把一段文本解析成「一条条账号对象」，兼容多种导出形态。
+     *
+     * 对齐上游 import.go 2026-11 版 `decodeCockpitAccounts`（commit 585ae7f2 / cd884503）——
+     * 上游此前只认顶层数组，用户从 cockpit 详情页复制的**嵌套/信封/字典**形态一律被判非法。
+     * 现在按顺序识别（先命中者胜，递归深度上限 2）：
+     *  ① 顶层数组 → 逐条；
+     *  ② 信封对象 `{accounts|data|list|items|results|auths: [...] 或 {...}}` → 拆开后逐条
+     *     （**不把信封名当 uid**，这是上游专门修过的 bug）；
+     *  ③ 字典 `{"<uid>": {...}}`（顶层没有任何账号字段、且所有值都是对象）→ 逐条，
+     *     条目自身没有 uid 时才用字典 key 兜底；
+     *  ④ 单个扁平对象 / 含 `account`、`auth` 的嵌套对象 → 当一条（由 [buildRow] 展平）。
+     *
+     * 解析不出来一律抛 [ParseException]，由调用方转成用户可见报错。
+     */
+    fun decodeObjects(raw: String): List<JsonObject> {
         val text = raw.trim()
         if (text.isEmpty()) throw ParseException("内容为空")
         val el = runCatching { AppJson.parseToJsonElement(text) }
             .getOrElse { throw ParseException("JSON 解析失败：${it.message}") }
-        val objs = when (el) {
-            is JsonArray -> el.mapNotNull { it as? JsonObject }
-            is JsonObject -> listOf(el)
-            else -> emptyList()
+        val out = ArrayList<JsonObject>()
+        when (el) {
+            // 数组元素也递归展开：`[{"data":[{...}]}]`、`[{"<uid>":{...}}]` 这类与单对象
+            // 同构的形态不该因为多套了一层数组就整份被丢（上游 decodeCockpitAccounts 同口径）。
+            is JsonArray -> el.forEach { if (it is JsonObject) out += unwrap(it, 0) }
+            is JsonObject -> out += unwrap(el, 0)
+            else -> throw ParseException("未解析到任何账号（内容不是 JSON 对象或数组）")
         }
-        // 对齐 import.go:67-70「empty accounts array」。
-        if (objs.isEmpty()) throw ParseException("未解析到任何账号（空数组或格式不符）")
-        return objs
+        // 对齐 import.go 的「empty accounts array」。
+        if (out.isEmpty()) throw ParseException("未解析到任何账号（空数组或格式不符）")
+        return out
+    }
+
+    /** 信封键（上游 import.go 的探测顺序）。 */
+    private val ENVELOPE_KEYS = listOf("accounts", "data", "list", "items", "results", "auths")
+
+    /** 「这看起来是一个账号对象」的特征键 —— 用于把字典形态与扁平对象区分开。 */
+    private val ACCOUNT_KEYS = setOf(
+        "uid", "userId", "user_id", "uin",
+        "access_token", "accessToken", "token", "refresh_token", "refreshToken",
+        "account", "auth", "domain", "expires_at", "expiresAt", "device_token", "deviceToken",
+    )
+
+    private fun unwrap(obj: JsonObject, depth: Int): List<JsonObject> {
+        if (depth > 2) return listOf(obj)
+        // 先判「这本身就是一个账号」：账号对象里完全可能有个叫 data / items 的业务字段，
+        // 若先走信封分支会把整条替换成那个字段（丢 uid/token，报「缺少必填字段」）。
+        if (obj.keys.any { it in ACCOUNT_KEYS }) return listOf(obj)
+        // ① 信封对象：值是数组 → 逐条；值是单个对象 → 当一条（并继续下钻，可能是字典）。
+        for (k in ENVELOPE_KEYS) {
+            when (val v = obj[k]) {
+                is JsonArray -> return v.filterIsInstance<JsonObject>().flatMap { unwrap(it, depth + 1) }
+                is JsonObject -> return unwrap(v, depth + 1)
+                else -> Unit
+            }
+        }
+        // ② 字典形态 {"<uid>": {...}}：自身没有账号特征键，且至少有一个对象值。
+        //    非对象值（如 "total": 2 这类统计字段）忽略，不影响其余账号的导入。
+        val objValues = obj.entries.mapNotNull { (k, v) -> (v as? JsonObject)?.let { k to it } }
+        if (objValues.isNotEmpty()) {
+            return objValues.sortedBy { it.first }.flatMap { (k, v) ->
+                // 条目自身有 uid 就以它为准；没有才用字典 key 兜底 —— 但 key 必须是合法 uid
+                // 形态（邮箱 / 含空格的中文键注进去只会被判「uid 非法」并丢掉整条）。
+                if (v.text("uid", "userId", "user_id", "uin").isBlank() && validUid(k)) {
+                    listOf(JsonObject(v + ("uid" to JsonPrimitive(k))))
+                } else {
+                    listOf(v)
+                }
+            }
+        }
+        // ③ 扁平 / 嵌套单条。
+        return listOf(obj)
+    }
+
+    /**
+     * 把嵌套形态 `{account:{...}, auth:{...}}` 展平成一层（内层覆盖外层）。
+     * 对齐上游 `decodeCockpitOne` 的第三种尝试；不是嵌套形态时原样返回。
+     */
+    private fun flatten(obj: JsonObject): JsonObject {
+        var cur = obj
+        var guard = 0
+        while (guard++ < 3) {
+            val acc = cur["account"] as? JsonObject
+            val auth = cur["auth"] as? JsonObject
+            if (acc == null && auth == null) break
+            val base: Map<String, kotlinx.serialization.json.JsonElement> = cur - "account" - "auth"
+            cur = JsonObject(base + (acc ?: emptyMap()) + (auth ?: emptyMap()))
+        }
+        return cur
     }
 
     /**
@@ -88,7 +166,9 @@ object CredentialTransfer {
      *
      * @param fallbackRealm 凭证里**没有** domain 时兜底使用的域（用户勾选 CN / Global）。
      */
-    fun buildRow(obj: JsonObject, fallbackRealm: String): Row {
+    fun buildRow(rawObj: JsonObject, fallbackRealm: String): Row {
+        // 嵌套形态（account/auth）先展平；扁平形态原样返回。
+        val obj = flatten(rawObj)
         val id = obj.text("id")
         val uid = obj.text("uid", "userId", "user_id", "uin").trim()
         val at = obj.text("access_token", "accessToken", "token").trim()
@@ -166,6 +246,40 @@ object CredentialTransfer {
      * 且上游 `auth.Auth` 落盘口径覆盖的字段（uid / nickname / access_token / refresh_token /
      * domain / expires_at），其余 cockpit 专有字段（token_type 之外）不臆造。
      */
+    /**
+     * 批量导出：输出**带元数据**的 JSON 数组（uid / nickname / domain / expires_at + 一对 token）。
+     *
+     * 与单条 [encode] 的取舍不同：单条复制只给最小凭证（越短越省事、暴露面越小）；批量导出
+     * 是「换机 / 备份」场景，必须带 uid 才能分辨账号、带 expires_at 才能保留有效期，
+     * 因此这里输出完整但**仍只含上游 auth.Auth 口径**的字段（不臆造 cockpit 专有字段）。
+     */
+    fun encodeBulk(entries: List<AuthEntry>): String {
+        val arr = entries.map { toJson(it, withMeta = true) }
+        return PrettyJson.encodeToString(JsonArray.serializer(), JsonArray(arr))
+    }
+
+    private fun toJson(a: AuthEntry, withMeta: Boolean): JsonObject = buildJsonObject {
+        if (withMeta) {
+            put("uid", JsonPrimitive(a.uid))
+            if (a.nickname.isNotBlank()) put("nickname", JsonPrimitive(a.nickname))
+            val d = if (a.domain.isNotBlank()) a.domain else if (a.realm == "global") "workbuddy.ai" else "codebuddy.cn"
+            put("domain", JsonPrimitive(d))
+            // 与导入端对称：cockpit 口径的毫秒；无有效期则省略（导入侧会兜底 365 天）。
+            if (a.access_expires_at > 0) put("expires_at", JsonPrimitive(a.access_expires_at * 1000L))
+        }
+        put("access_token", JsonPrimitive(a.access_token))
+        put("refresh_token", JsonPrimitive(a.refresh_token))
+        if (a.device_token.isNotBlank()) put("device_token", JsonPrimitive(a.device_token))
+        if (a.device_id.isNotBlank()) put("device_id", JsonPrimitive(a.device_id))
+        if (a.enterprise_id.isNotBlank()) put("enterprise_id", JsonPrimitive(a.enterprise_id))
+    }
+
+    /** 导出文件名（SAF 预填用）：`wb2api-credentials-20261115-1730.json`。 */
+    fun suggestFileName(prefix: String = "wb2api-credentials"): String {
+        val ts = java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.US).format(java.util.Date())
+        return "$prefix-$ts.json"
+    }
+
     fun encode(a: AuthEntry): String {
         // ★ 只导出**最小可用凭证**（一对 token）。uid / domain / expires_at 都能在导入侧自动补齐
         //   （uid 用 access_token 联网换取、domain 走用户选择、过期时间兜底 365 天），
@@ -229,10 +343,13 @@ data class ImportReport(
     val imported: Int,
     val skipped: Int,
     val errors: List<String> = emptyList(),
+    /** 其中「覆盖了本地已有账号」的条数（对齐上游 importCockpit 的 overwrites 口径）。 */
+    val overwrites: Int = 0,
 ) {
     /** 一行摘要（同时用于 toast 与弹层展示）。 */
     fun summary(): String = buildString {
         append("成功 ").append(imported).append(" 个")
+        if (overwrites > 0) append("（覆盖 ").append(overwrites).append(" 个）")
         if (skipped > 0) append("，跳过 ").append(skipped).append(" 个")
         append("（共 ").append(total).append(" 条）")
     }
