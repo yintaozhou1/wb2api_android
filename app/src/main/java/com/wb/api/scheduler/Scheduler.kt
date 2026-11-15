@@ -182,7 +182,8 @@ object Scheduler {
         // 因此不再对注定失败的端点空发请求，也不记账为失败。
         if (a.isEnterprise) return "企业版无签到（上游不支持）"
         val r = Gateway.upstream.checkin(a)
-        Gateway.pool.markCheckin(a.uid)
+        // 「处理中」不是终态：不记签到时刻，否则今天不会再补签、这一天的积分就丢了。
+        if (r == "ok" || r == "已签到") Gateway.pool.markCheckin(a.uid)
         return r
     }
 

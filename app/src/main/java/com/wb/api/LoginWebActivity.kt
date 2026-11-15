@@ -480,7 +480,8 @@ class LoginWebActivity : ComponentActivity() {
                 // 企业版无个人成长体系：不发起注定被拒的签到（上游 400 code 10001）。
                 if (realm != "global" && !entry.isEnterprise) {
                     runCatching { Gateway.upstream.checkin(entry) }
-                        .onSuccess { Gateway.pool.markCheckin(entry.uid) }
+                        // 「处理中」不记签到时刻（见 isCheckinDone 注释）。
+                        .onSuccess { r -> if (Gateway.upstream.isCheckinDone(r)) Gateway.pool.markCheckin(entry.uid) }
                 }
                 val soonSec = com.wb.api.core.Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
                 runCatching { Gateway.upstream.balanceDetailed(entry, soonSec) }

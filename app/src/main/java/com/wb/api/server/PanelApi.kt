@@ -278,18 +278,24 @@ object PanelApi {
                     return
                 }
                 val r = runCatching { runBlocking { Gateway.upstream.checkin(a) } }
-                if (r.isSuccess) {
-                    // 只有成功才记录签到时刻 + 解除冷却；失败时保留上游给的冷却信号。
-                    Gateway.pool.markCheckin(uid)
+                // 账号本身可用 → 解除冷却；但只有「确定完成」才记签到时刻
+                // （「处理中」不是终态，记了今天就不会再补签）。
+                val v = r.getOrNull()
+                if (v != null) {
                     Gateway.pool.revive(uid)
+                    if (Gateway.upstream.isCheckinDone(v)) Gateway.pool.markCheckin(uid)
                 }
-                val already = r.getOrNull() == "已签到"
+                val already = v == "已签到"
                 res.sendJson(200, buildJsonObject {
-                    put("ok", JsonPrimitive(r.isSuccess))
+                    put("ok", JsonPrimitive(v != null && v != "处理中"))
                     put("already", JsonPrimitive(already))
                     put("message", JsonPrimitive(
-                        r.getOrNull()?.let { if (it == "已签到") "今日已签到" else "签到成功" }
-                            ?: (r.exceptionOrNull()?.message ?: "签到失败")
+                        when {
+                            v == null -> r.exceptionOrNull()?.message ?: "签到失败"
+                            v == "已签到" -> "今日已签到"
+                            v == "处理中" -> "上游处理中，稍后由巡检自动补签"
+                            else -> "签到成功"
+                        }
                     ))
                 })
             }
@@ -347,8 +353,12 @@ object PanelApi {
                             "checkin" -> {
                                 if (a.isEnterprise) throw IllegalStateException("企业版无签到（上游不支持）")
                                 val v = Gateway.upstream.checkin(a)
-                                Gateway.pool.markCheckin(a.uid)
-                                if (v == "已签到") "今日已签到" else "签到成功"
+                                if (Gateway.upstream.isCheckinDone(v)) Gateway.pool.markCheckin(a.uid)
+                                when (v) {
+                                    "已签到" -> "今日已签到"
+                                    "处理中" -> "上游处理中，稍后由巡检自动补签"
+                                    else -> "签到成功"
+                                }
                             }
                             "balance" -> {
                                 val soonSec = com.wb.api.core.Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)

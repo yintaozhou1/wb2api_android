@@ -1209,13 +1209,56 @@ class UpstreamClient(
 
     // ---------- 签到 / 余额 ----------
 
-    /** 每日签到（**POST**）。上游对「今天已签到」返回业务错误，按幂等成功处理。 */
+    /**
+     * 每日签到（**POST**）。返回 `ok` / `已签到` / `处理中` 三种「非失败」结论，真失败才抛异常。
+     *
+     * 对齐上游 2026-11 的签到回执口径（`internal/upstream/checkin_receipt.go`）：
+     *  - **处理中**（`请求处理中` / `request is being processed`）是**非终态**：上游还在算，
+     *    既不能当成功（会漏掉今天的积分），也不能当失败（会触发无意义的账号处置）。
+     *    上游的做法是内联补打（最多 3 次）；这里同口径，仍处理中就返回 `处理中`，
+     *    由调用方**不**标记签到时刻 —— 巡检补签会在下一轮自然重试。
+     *  - **已签到**：重复签到返回业务错误，按幂等成功处理。
+     *  - **失败**：`签到失败，请稍后重试` 这类是**真失败**（上游实测归 failed，不是 pending），
+     *    照常抛异常交给上游错误分类决定冷却。
+     */
     suspend fun checkin(auth: AuthEntry): String = withContext(Dispatchers.IO) {
         val paths = Up.meterPaths(auth.realm, Up.P_CHECKIN, Up.P_CHECKIN_ALT)
-        val r = billingCall(auth.realm, auth, "POST", paths, "{}")
-        if (r.ok) return@withContext "ok"
-        if (r.text.contains("已签到") || r.text.lowercase().contains("already")) return@withContext "已签到"
-        throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.take(160)}")
+        var last = HttpResult(0, "", "")
+        for (attempt in 0..3) {
+            val r = billingCall(auth.realm, auth, "POST", paths, "{}")
+            last = r
+            val pending = isCheckinPending(r.text)
+            if (r.ok && !pending) return@withContext "ok"
+            if (isCheckinAlready(r.text)) return@withContext "已签到"
+            // 只有「处理中」值得立刻补打；其余失败（含真 429 限流）不在这里重试，
+            // 交给上层冷却与巡检，避免把一次限流放大成 4 次请求。
+            if (pending && attempt < 3) delay(1200L * (attempt + 1)) else break
+        }
+        if (isCheckinPending(last.text)) return@withContext "处理中"
+        throw UpstreamException(
+            Classify.of(last.code, last.text), last.code,
+            "HTTP ${last.code} @ ${last.url} :: ${last.text.take(160)}",
+        )
+    }
+
+    /**
+     * 这次签到是否已「确定完成」（可以记签到时刻）。
+     *
+     * 所有调用点都必须用它判定，不能只看「没抛异常」：`处理中` 也是非失败返回值，
+     * 但它意味着今天的积分还没落账 —— 记了签到时刻，今天的补签就再也不会发生。
+     */
+    fun isCheckinDone(result: String): Boolean = result == "ok" || result == "已签到"
+
+    /** 上游「签到请求处理中」判据（非终态）。 */
+    private fun isCheckinPending(text: String): Boolean {
+        val t = text.lowercase()
+        return text.contains("请求处理中") || t.contains("being processed") || t.contains("processing")
+    }
+
+    /** 上游「今天已签到」判据（幂等成功）。 */
+    private fun isCheckinAlready(text: String): Boolean {
+        if (isCheckinPending(text)) return false
+        return text.contains("已签到") || text.lowercase().contains("already")
     }
 
     /**
