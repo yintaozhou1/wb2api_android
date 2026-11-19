@@ -49,11 +49,14 @@ object PanelApi {
     private fun overview(res: Res) {
         val counts = Gateway.pool.counts()
         val obj = buildJsonObject {
-            put("version", JsonPrimitive("1.11.11-panel-android"))
+            // 版本必须取自构建产物：硬编码会与 App 的 versionName 长期漂移
+            // （面板上显示 1.11.11、安装包却是 1.7.x，排查时极易误判）。
+            put("version", JsonPrimitive("${com.wb.api.BuildConfig.VERSION_NAME}(android)"))
             put("uptime_sec", JsonPrimitive(Gateway.uptimeSec()))
             put("running", JsonPrimitive(Gateway.running.value))
             put("port", JsonPrimitive(Gateway.displayPort()))
             put("auth_required", JsonPrimitive(Gateway.store.config.api_key.isNotBlank()))
+            // Android 端没有 Redis：恒为 noop 是**事实**，不是占位（面板据此隐藏 Redis 相关项）。
             put("redis_mode", JsonPrimitive("noop"))
             put("sticky_sessions", JsonPrimitive(Gateway.pool.stickyCount()))
             put("total", JsonPrimitive(counts.total))
@@ -236,6 +239,8 @@ object PanelApi {
         }
         Gateway.store.saveAuth(entry)
         Gateway.pool.reload()
+        // 登录已完成：state 不再需要（否则这张 state→realm 表会在进程常驻期间无限增长）。
+        loginStates.remove(state)
         LogBus.log("panel: 登录成功 ${entry.nickname}(${entry.uid.take(8)})")
         res.sendJson(200, buildJsonObject {
             put("status", JsonPrimitive("ok"))
@@ -340,7 +345,7 @@ object PanelApi {
             })
             return
         }
-        if (op !in setOf("checkin", "balance", "activity")) {
+        if (op !in setOf("checkin", "balance", "activity", "keepalive")) {
             res.sendError(501, "operation '$op' is not implemented by this client", "not_implemented")
             return
         }
@@ -375,6 +380,18 @@ object PanelApi {
                                 val cid = "wb2api-panel-${System.currentTimeMillis()}-${a.uid.take(8)}"
                                 Gateway.upstream.reportChatActivity(a, cid, "")
                                 "ok"
+                            }
+                            // token 保活：面板「全部保活」的真实实现（1.7.4 之前回 501）。
+                            // force 窗口 1 小时：用户主动点就意味着「现在就把能续的都续了」。
+                            "keepalive" -> {
+                                val r = Gateway.upstream.keepalive(a, 3600)
+                                if (r.renewed != null) {
+                                    Gateway.store.saveAuth(r.renewed)
+                                    Gateway.pool.reload()
+                                }
+                                if (r.state == "dead") Gateway.pool.markSessionDead(a.uid)
+                                if (r.state == "dead") throw IllegalStateException(r.message)
+                                r.message
                             }
                             else -> throw IllegalStateException("unknown op: $op")
                         }

@@ -5,6 +5,8 @@ import com.wb.api.core.Durations
 import com.wb.api.core.LogBus
 import com.wb.api.core.ScheduleCfg
 import com.wb.api.model.AuthEntry
+import com.wb.api.upstream.UpstreamClient
+import com.wb.api.model.CredentialHealth
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -53,8 +55,6 @@ object Scheduler {
 
     fun stop() { job?.cancel(); job = null }
 
-    fun isRunning(): Boolean = job != null
-
     private fun dayFmt() = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
     private fun todayStartSec(): Long {
@@ -98,9 +98,14 @@ object Scheduler {
             }
         }
 
-        // 定时任务区。**成长任务 / 活跃上报 / 连登管家均已接入真实上游接口**（1.5.1~1.5.2 完成）；
-        // 仍未接入的是猫猫旅行与 token 保活（夜猫子任务已随上游下架移除）—— 如实记为
-        // 「未实现」，绝不伪装成功。
+        // 凭证保活巡检：AT 剩余不足 30 分钟就提前续一次。这是「闲置一天后第一个请求先撞 401」
+        // 的正解 —— 1.7.3 之前只在请求路径上临期续期，账号不请求就永远不会续，UI 上看到的
+        // 「可用」其实是「本地记录早已过期」。
+        runCatching { keepaliveSweep(s.keepalive_enabled) }
+            .onFailure { LogBus.log("[token] 保活巡检异常：${it.message}") }
+
+        // 定时任务区。**成长任务 / 活跃上报 / 连登管家 / token 保活均已接入真实上游接口**；
+        // 仍未接入的是猫猫旅行（上游接口未公开）—— 如实记为「未实现」，绝不伪装成功。
         if (s.growth_enabled && hour in s.growth_hours) once("growth", hour) {
             // `once` 的 block 不是挂起上下文 —— 与「补签巡检」同样处理：就地 runBlocking。
             // 该分支跑在 Scheduler 的 IO 调度协程里，阻塞的是调度线程而不是主线程。
@@ -120,7 +125,11 @@ object Scheduler {
                 .onFailure { LogBus.log("[连登] 管家失败：${it.message}") }
         }
         if (s.travel_enabled && hour in s.travel_hours) once("travel", hour) { LogBus.log("猫猫旅行：上游接口未接入，跳过") }
-        if (s.keepalive_enabled && hour in s.keepalive_hours) once("keepalive", hour) { LogBus.log("token 保活：上游接口未接入，跳过") }
+        // 整点全量保活：把「还没到巡检窗口但用户已配置」的号也刷一遍（幂等：不需要续期的直接跳过）。
+        if (s.keepalive_enabled && hour in s.keepalive_hours) once("keepalive", hour) {
+            runCatching { keepaliveAll(force = true) }
+                .onFailure { LogBus.log("[token] 整点保活失败：${it.message}") }
+        }
 
         // 键的形态是 "<name>-<yyyy-MM-dd>-<hour>"，所以判「今天的键」必须用 **contains**：
         // 原实现用 endsWith(日期)，对任何键恒为 false → 触发阈值时把**当天所有**幂等标记
@@ -185,6 +194,95 @@ object Scheduler {
         // 「处理中」不是终态：不记签到时刻，否则今天不会再补签、这一天的积分就丢了。
         if (r == "ok" || r == "已签到") Gateway.pool.markCheckin(a.uid)
         return r
+    }
+
+    // ---------- 凭证保活 ----------
+
+    /** 巡检节流：15 分钟一轮（AT 有效期 1 小时，15 分钟粒度足够早，又不会把上游打成刷子）。 */
+    private val keepaliveSweepMs = 15 * 60_000L
+
+    /** 单轮最多续多少个号：避免多账号时一次性把 refresh 打成尖峰。 */
+    private val maxKeepalivePerSweep = 8
+
+    private var lastKeepaliveMs = 0L
+
+    /** 续期失败的短期退避（uid → 可重试时刻 ms）：坏号不要每轮都撞一次上游。 */
+    private val keepaliveBackoff = ConcurrentHashMap<String, Long>()
+
+    /**
+     * 保活巡检（每 tick 调用，内部按 [keepaliveSweepMs] 节流）。
+     *
+     * 只挑「AT 剩余 < 30 分钟且还有 RT、RT 未过期」的号；跳过禁用/暂停。
+     * 续期成功 → 落盘 + 池重载（UI 的「凭证过期」会立刻回到「可用」）；
+     * 明确被拒 → 标记 session dead（UI 显示「凭证失效」，并提示重新登录）；
+     * 无结论 → 30 分钟内不重试（网络抖动不该变成每 15 分钟一次的上游请求）。
+     */
+    private fun keepaliveSweep(enabled: Boolean) {
+        if (!enabled) return
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastKeepaliveMs < keepaliveSweepMs) return
+        lastKeepaliveMs = nowMs
+        // 清掉已到期的退避项，避免 map 无限增长。
+        keepaliveBackoff.entries.removeIf { it.value <= nowMs }
+        val now = nowMs / 1000
+        val targets = Gateway.store.auths().asSequence()
+            .filter { a ->
+                val st = Gateway.store.stateOf(a.uid)
+                !st.disabled && (keepaliveBackoff[a.uid] ?: 0L) <= nowMs
+            }
+            .filter { a ->
+                CredentialHealth.needsRenew(
+                    a.access_token, a.access_expires_at,
+                    a.refresh_token, a.refresh_expires_at, now, 1800,
+                )
+            }
+            .take(maxKeepalivePerSweep)
+            .toList()
+        if (targets.isEmpty()) return
+        LogBus.log("[token] 保活巡检：${targets.size} 个账号 AT 即将到期，开始续期")
+        var ok = 0
+        targets.forEach { a ->
+            val r = runCatching { runBlocking { Gateway.upstream.keepalive(a, 1800) } }
+                .getOrElse { UpstreamClient.KeepaliveResult("unknown", it.message ?: "续期异常") }
+            when (r.state) {
+                "renewed" -> {
+                    r.renewed?.let { Gateway.store.saveAuth(it) }
+                    Gateway.pool.reload()
+                    ok++
+                }
+                "dead" -> Gateway.pool.markSessionDead(a.uid)
+                "unknown" -> keepaliveBackoff[a.uid] = nowMs + 30 * 60_000L
+                // ok / skipped：无需动作（ok = 会话仍有效但本次续期没成，等下一轮自然重试）
+            }
+            LogBus.log("[token] uid=${a.uid.take(8)} ${r.state}：${r.message}")
+        }
+        LogBus.log("[token] 保活完成 $ok/${targets.size}")
+    }
+
+    /**
+     * 全量保活（整点任务 / 面板 `keepalive_all`）。
+     *
+     * @param force 忽略「剩余 30 分钟」窗口：用于用户主动点击「全部保活」时把每个能续的号都续一次。
+     *              仍然跳过「不需要续期」的号（RT 缺失 / RT 已过期 / AT 仍够久），所以幂等。
+     */
+    fun keepaliveAll(force: Boolean = false): Int {
+        val now = System.currentTimeMillis() / 1000
+        val window = if (force) 3600L else 1800L
+        var ok = 0
+        Gateway.store.auths().forEach { a ->
+            val st = Gateway.store.stateOf(a.uid)
+            if (st.disabled) return@forEach
+            val r = runCatching { runBlocking { Gateway.upstream.keepalive(a, window) } }.getOrNull() ?: return@forEach
+            if (r.state == "renewed") {
+                r.renewed?.let { Gateway.store.saveAuth(it) }
+                ok++
+            } else if (r.state == "dead") {
+                Gateway.pool.markSessionDead(a.uid)
+            }
+        }
+        if (ok > 0) Gateway.pool.reload()
+        LogBus.log("[token] 全量保活：$ok 个账号已续期")
+        return ok
     }
 
     private fun runBulk(label: String, op: suspend (AuthEntry) -> Any?) {

@@ -6,6 +6,7 @@ import com.wb.api.core.primText
 import com.wb.api.core.primTextOrNull
 import com.wb.api.core.LogBus
 import com.wb.api.model.AuthEntry
+import com.wb.api.model.CredentialHealth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -63,7 +64,7 @@ object Up {
      * 两版发版节奏不同，**必须按 realm 分开**：国际版用 CN 的版本号会与上游实际分发包对不上
      * （旧实现共用 5.5.4，是「UA 指纹过期」的一部分）。
      */
-    const val DEFAULT_CLIENT_VERSION_CN = "5.9.3"
+    const val DEFAULT_CLIENT_VERSION_CN = "5.11.3"
     const val DEFAULT_CLIENT_VERSION_GLOBAL = "5.9.4"
     /** 官方内置 CLI 版本（两版分发包同一值）。 */
     /**
@@ -154,8 +155,17 @@ object Up {
      */
     const val BUILTIN_CLI_VERSION = "2.165.0"
 
-    /** 桌面客户端 UA：WorkBuddy 5.9.3 内嵌 CLI 2.165.0。 */
-    const val UA_DESKTOP = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
+    /**
+     * 出站 UA 的 `CLI/<v>` 段：**随分发包走**，不是一个全局值。
+     *
+     * 上游 2026-11-16 拆包取证（commit 2fa6876e）：CN 5.11.3 包内置 `@genie/agent-cli`
+     * 2.176.0；国际分发包最新仍是 5.9.4（带 2.165.0）。两者混用会让 UA 与实际包对不上，
+     * 与国际链路无关的 CN 升级也不该改国际链路的形状。
+     */
+    fun cliVersion(realm: String): String = if (realm == "global") "2.165.0" else "2.176.0"
+
+    /** 桌面客户端 UA（CN 5.11.3 分发包，内嵌 CLI 2.176.0）。国际版请用 [workBuddyUA]。 */
+    const val UA_DESKTOP = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0"
     /** Web 端浏览器 UA（desktop.go:267）。 */
     const val UA_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
     /** 小程序口径头值（tasks.go:35）。 */
@@ -211,7 +221,7 @@ object Up {
     fun workBuddyUA(
         realm: String,
         clientVersion: String = clientVersion(realm),
-        cliVersion: String = BUILTIN_CLI_VERSION,
+        cliVersion: String = cliVersion(realm),
     ): String {
         val brand = if (realm == "global") "workbuddy-ai" else "WorkBuddy"
         return "WorkBuddy/$clientVersion $brand/$clientVersion CLI/$cliVersion"
@@ -226,7 +236,7 @@ object Up {
      * 该端点按 UA 家族下发不同模型集合，官方真机同时出现两种形态，故两路都要探。
      */
     fun workBuddyUaLite(realm: String): String =
-        "WorkBuddy/${clientVersion(realm)} CLI/$BUILTIN_CLI_VERSION"
+        "WorkBuddy/${clientVersion(realm)} CLI/${cliVersion(realm)}"
 
     /** 按 uid + 用途稳定派生 36 hex 标识（跨重启恒定，账号间互异）。 */
     fun stableId(uid: String, purpose: String): String {
@@ -488,6 +498,15 @@ class UpstreamClient(
             b.header("Origin", origin)
             b.header("Referer", "$origin/")
             b.header("User-Agent", if (userAgentOverride.isNotBlank()) userAgentOverride else Up.workBuddyUA(realm))
+        }
+        // 国内版 5.11.3 桌面端在**产品 endpoint** 上追加的客户端身份三头（上游 issue #257，
+        // 2026-11-18 真机抓包 130 次恒同现：5.11.3 / windows / WorkBuddy）。
+        // 国际版分发包没有这一层 —— **绝不能**跟着加，否则等于给国际链路套上它不存在的指纹。
+        // 小程序口径的请求必须撤掉这三个头；本项目 growth 的 mp 路径尚未接入，故此处无需排除。
+        if (realm == "cn") {
+            b.header("X-Client-Version", Up.clientVersion(realm))
+            b.header("X-Client-Platform", "windows")
+            b.header("X-Client-Product", "WorkBuddy")
         }
         if (auth != null) {
             if (auth.access_token.isNotBlank()) b.header("Authorization", "Bearer ${auth.access_token}")
@@ -832,12 +851,7 @@ class UpstreamClient(
                 val data = parseEnvelope(text)
                 val access = data.str("access_token", "accessToken", "token")
                 if (access.isBlank()) return@withContext null
-                auth.copy(
-                    access_token = access,
-                    refresh_token = data.str("refresh_token", "refreshToken").ifBlank { auth.refresh_token },
-                    access_expires_at = System.currentTimeMillis() / 1000 + 3600,
-                    updated_at = System.currentTimeMillis() / 1000,
-                )
+                renewedAuth(auth, access, data.str("refresh_token", "refreshToken"))
             }
         }.getOrNull()
     }
@@ -855,6 +869,82 @@ class UpstreamClient(
      *  - refresh 失败且是**应用层明确判词**（4xx、非 429、非 HTML 拦截页、非空体）→ DEAD；
      *  - 其余（传输错误 / 5xx / 429 / HTML 页 / 空体 / 无 RT）→ UNKNOWN，绝不据此禁用。
      */
+    /**
+     * 用一次刷新结果构造新凭证。
+     *
+     * `refresh_expires_at` 必须一起往后推：它是**本地估算**（上游授权响应不给 RT 到期时间，
+     * 本端按 30 天记）。续期成功后如果还留着旧值，30 天后 [com.wb.api.model.CredentialHealth]
+     * 会把一个仍在正常使用的号标成「续期凭证已失效」—— 这正是「按估算值定罪」的坑。
+     */
+    private fun renewedAuth(auth: AuthEntry, access: String, refresh: String): AuthEntry {
+        val now = System.currentTimeMillis() / 1000
+        return auth.copy(
+            access_token = access,
+            refresh_token = refresh.ifBlank { auth.refresh_token },
+            access_expires_at = now + 3600,
+            refresh_expires_at = now + 30L * 86400,
+            updated_at = now,
+        )
+    }
+
+    /** 保活结论（调度器 / 面板 / 详情页共用）。 */
+    data class KeepaliveResult(
+        /** ok=仍有效 / renewed=已续期 / dead=续期凭证失效 / unknown=无结论（可重试）/ skipped=不需要。 */
+        val state: String,
+        val message: String,
+        val renewed: AuthEntry? = null,
+    )
+
+    /**
+     * token 保活：在 AT 临期/过期时主动续期一次。
+     *
+     * 与「请求路径」上的续期（[com.wb.api.upstream.CredentialService.renew]）是同一个动作，
+     * 区别只是**触发时机**：这里由定时任务提前做，避免账号闲置一天后第一个请求先撞 401。
+     *
+     * @param windowSec 剩余有效期小于该值才续。默认 30 分钟（比 UI 的「临期 10 分钟」更早，
+     *                  给网络抖动留出重试余量）。
+     */
+    suspend fun keepalive(
+        auth: AuthEntry,
+        windowSec: Long = 1800L,
+        force: Boolean = false,
+    ): KeepaliveResult =
+        withContext(Dispatchers.IO) {
+            val now = System.currentTimeMillis() / 1000
+            // 无 RT / RT 估算过期都**不能**判死：前者 AT 可能还有效，后者只是本地估算。
+            // 判死会 disabled 掉一个实际健康的号（用户被迫重新登录），这正是本轮要消灭的误杀。
+            if (auth.refresh_token.isBlank()) {
+                return@withContext KeepaliveResult("skipped", "没有续期凭证，无法保活（AT 到期后需要重新登录）")
+            }
+            if (!force && !CredentialHealth.needsRenew(
+                    auth.access_token, auth.access_expires_at,
+                    auth.refresh_token, auth.refresh_expires_at, now, windowSec,
+                )
+            ) {
+                return@withContext KeepaliveResult(
+                    "skipped",
+                    "暂不需要续期（剩余 ${CredentialHealth.fmt(CredentialHealth.remainingSec(auth.access_expires_at, now))}）",
+                )
+            }
+            // 统一走单飞入口：与请求路径共用同一把 uid 锁，避免并发轮换 RT。
+            val renewed = CredentialService.renew(auth, minRemainingSec = windowSec, force = force)
+            if (renewed != null) {
+                return@withContext KeepaliveResult(
+                    "renewed",
+                    "已续期（新 AT 剩余 ${CredentialHealth.fmt(CredentialHealth.remainingSec(renewed.access_expires_at, System.currentTimeMillis() / 1000))}）",
+                    renewed,
+                )
+            }
+            // 续期失败：只有「明确判词」才算死，传输抖动一律 unknown（可重试）。
+            val proof = runCatching { CredentialService.prove(auth) }
+                .getOrDefault(SessionProof(SessionVerdict.UNKNOWN))
+            when (proof.verdict) {
+                SessionVerdict.DEAD -> KeepaliveResult("dead", "续期被上游拒绝，需要重新登录")
+                SessionVerdict.ALIVE -> KeepaliveResult("ok", "续期请求失败但会话仍有效（稍后重试）", proof.renewed)
+                SessionVerdict.UNKNOWN -> KeepaliveResult("unknown", "续期无明确结论（网络/上游异常），稍后重试")
+            }
+        }
+
     suspend fun verifySession(auth: AuthEntry): SessionProof = withContext(Dispatchers.IO) {
         if (auth.refresh_token.isBlank()) {
             return@withContext SessionProof(SessionVerdict.UNKNOWN)
@@ -887,12 +977,9 @@ class UpstreamClient(
                             if (looksDead(text)) SessionVerdict.DEAD else SessionVerdict.UNKNOWN,
                         )
                     }
-                    val renewed = auth.copy(
-                        access_token = access,
-                        refresh_token = data?.str("refresh_token", "refreshToken")
-                            ?.ifBlank { auth.refresh_token } ?: auth.refresh_token,
-                        access_expires_at = System.currentTimeMillis() / 1000 + 3600,
-                        updated_at = System.currentTimeMillis() / 1000,
+                    val renewed = renewedAuth(
+                        auth, access,
+                        data?.str("refresh_token", "refreshToken").orEmpty(),
                     )
                     return@use SessionProof(SessionVerdict.ALIVE, renewed)
                 }
@@ -1910,21 +1997,154 @@ class UpstreamClient(
      * 对单个账号做一次端到端探测，逐条打印 URL / HTTP 状态 / 响应片段，
      * 用于在 App 日志中直接定位「哪个域名或路径不可达」。
      */
-    suspend fun diagnose(auth: AuthEntry): String = withContext(Dispatchers.IO) {
+    /**
+     * 自检结论：`verdict` 是给用户看的一行结论，`lines` 是给日志看的明细。
+     *
+     * 1.7.4 之前的自检只输出「token=有(1234 字符)」——它回答的是「字段非空吗」，
+     * 而不是用户真正想知道的问题：「这个号现在还能用吗、还能用多久、要不要重新登录」。
+     * 现在自检做**真实动作**：临期先续期 → 用 Bearer 调鉴权端点验证 AT → 查余额 →
+     * 探模型目录，最后给一句可执行结论；确认失效时由调用方写回账号状态。
+     */
+    data class DiagReport(
+        val ok: Boolean,
+        val verdict: String,
+        val lines: List<String>,
+        /** 自检过程中刷新出的新凭证（调用方需落盘并入池）。 */
+        val renewed: AuthEntry? = null,
+        /** 续期被上游明确拒绝（调用方应标记账号需要重新登录）。 */
+        val dead: Boolean = false,
+    )
+
+    /**
+     * 网络 / 凭证自检。
+     *
+     * 顺序有意为之：**先修（续期）再验（鉴权）**，否则一个「只是 AT 过期」的号会被
+     * 探测成「凭证失效」，用户会去重新登录 —— 而它其实只差一次 refresh。
+     */
+    suspend fun diagnose(auth: AuthEntry): DiagReport = withContext(Dispatchers.IO) {
         val realm = auth.realm
-        val sb = StringBuilder()
-        sb.append("realm=$realm uid=${auth.uid.take(8)} token=${if (auth.access_token.isBlank()) "空" else "有(${auth.access_token.length}字符)"}\n")
-        for (base in Up.billingBases(realm)) {
-            val r = runCatching { billingOnce(base + Up.P_RESOURCE, realm, auth, "POST", resourceBody()) }
-                .getOrElse { HttpResult(0, it.message ?: "err", base + Up.P_RESOURCE) }
-            sb.append("资源 ${r.url} -> HTTP ${r.code} ${r.text.take(90).replace('\n', ' ')}\n")
-                .also { if (r.ok) sb.append("（POST + 固定 body，与真实余额查询一致；返回 200 即该域可用）\n") }
+        val lines = ArrayList<String>()
+        var renewed: AuthEntry? = null
+        var dead = false
+        var cur = auth
+        val now0 = System.currentTimeMillis() / 1000
+        lines += "realm=$realm uid=${auth.uid.take(8)} " +
+            "状态=${CredentialHealth.of(auth, now0).name} " +
+            "AT剩余=${CredentialHealth.fmt(CredentialHealth.remainingSec(auth.access_expires_at, now0))} " +
+            "RT=${if (auth.refresh_token.isBlank()) "无" else "有"}"
+
+        // ① 临期 / 已过期：先真的续一次（这是「自检」本该做的事）。
+        if (CredentialHealth.needsRenew(
+                auth.access_token, auth.access_expires_at,
+                auth.refresh_token, auth.refresh_expires_at, now0,
+            )
+        ) {
+            val r = runCatching { CredentialService.renew(auth, minRemainingSec = 60) }.getOrNull()
+            if (r != null && r.access_token != auth.access_token) {
+                renewed = r
+                cur = r
+                lines += "续期：成功（新 AT 剩余 " +
+                    CredentialHealth.fmt(CredentialHealth.remainingSec(r.access_expires_at, System.currentTimeMillis() / 1000)) + "）"
+            } else {
+                lines += "续期：失败（继续用现有 AT 探测）"
+            }
         }
+
+        // ② 鉴权探测：用 Bearer 调 `/v2/plugin/login/account`，200 且取到 uid 才算 AT 真有效。
+        val probe = authProbe(cur)
+        lines += "鉴权 ${probe.url} -> HTTP ${probe.code} ${probe.detail.take(80).replace('\n', ' ')}"
+        val authOk = probe.code in 200..299 && probe.uid.isNotBlank()
+
+        // ③ 余额（顺带证明 billing 域可用）。
+        val bal = runCatching { balanceDetailed(cur) }.getOrNull()
+        lines += when {
+            bal == null -> "余额：查询失败"
+            !bal.known -> "余额：上游未返回"
+            else -> "余额：${bal.remain}"
+        }
+
+        // ④ 模型目录（证明 chat 域可达）。
         for (base in Up.chatBases(realm)) {
-            val r = chatCallSingle(base, realm, auth)
-            sb.append("模型 $base${Up.P_MODELS_V3} -> HTTP ${r.code} ${r.text.take(90).replace('\n', ' ')}\n")
+            val r = chatCallSingle(base, realm, cur)
+            lines += "模型 $base -> HTTP ${r.code}"
         }
-        sb.toString().trim()
+
+        // ⑤ 结论
+        var verdict: String
+        if (probe.code == 0) {
+            // 传输层失败（连不上 / 超时 / TLS）：**不能**据此判断凭证好坏。
+            // 旧实现会继续走 prove（再打一次 refresh），在慢网下得出「已过期」的假结论。
+            verdict = "网络不可达，无法验证凭证：${probe.detail.take(60)}"
+        } else if (authOk) {
+            val left = CredentialHealth.remainingSec(cur.access_expires_at, System.currentTimeMillis() / 1000)
+            verdict = if (renewed != null) {
+                "凭证有效（已自动续期，AT 剩余 ${CredentialHealth.fmt(left)}）"
+            } else {
+                "凭证有效 · AT 剩余 ${CredentialHealth.fmt(left)}" + when {
+                    bal == null -> " · 余额查询失败"
+                    bal.known -> " · 余额 ${bal.remain}"
+                    else -> ""
+                }
+            }
+        } else {
+            // 鉴权失败：必须区分「RT 能救」与「RT 也死了」，否则会把可救的号判成需重登。
+            val proof = if (cur.refresh_token.isNotBlank()) {
+                runCatching { CredentialService.prove(cur) }.getOrDefault(SessionProof(SessionVerdict.UNKNOWN))
+            } else {
+                SessionProof(SessionVerdict.UNKNOWN)
+            }
+            when {
+                proof.verdict == SessionVerdict.DEAD -> {
+                    dead = true
+                    verdict = "凭证已失效：续期被上游拒绝，请重新登录（self-check 已标记）"
+                }
+                proof.renewed != null -> {
+                    renewed = proof.renewed
+                    verdict = "访问令牌已过期，已自动续期成功"
+                }
+                cur.refresh_token.isBlank() -> verdict = "凭证已失效：没有续期凭证，请重新登录"
+                else -> verdict = "鉴权失败，但续期未给出明确结论（网络/边缘拦截），请稍后重试"
+            }
+        }
+        LogBus.log("[diag] ${lines.joinToString(" | ")}")
+        DiagReport(
+            ok = authOk || renewed != null,
+            verdict = verdict,
+            lines = lines,
+            renewed = renewed,
+            dead = dead,
+        )
+    }
+
+    /** 鉴权探测结果（自检内部用）。 */
+    private data class AuthProbe(val code: Int, val detail: String, val uid: String, val url: String)
+
+    /**
+     * 用 Bearer 调鉴权端点验证 AT。
+     *
+     * 为什么选 `/v2/plugin/login/account` 而不是模型目录：模型目录对「无鉴权」也常回 200
+     * （部分中转/边缘节点），无法证明 token 有效；而鉴权端点必须带有效 Bearer 才返回 uid。
+     * 用 [verifyHttp]（6s 超时）：自检是用户主动触发的，不能卡 120s。
+     */
+    private fun authProbe(auth: AuthEntry): AuthProbe {
+        val url = Up.base(auth.realm) + Up.P_LOGIN_ACCOUNT
+        if (auth.access_token.isBlank()) return AuthProbe(0, "no access token", "", url)
+        val req = Request.Builder().url(url).get().apply {
+            header("Accept", "application/json")
+            header("X-Requested-With", "XMLHttpRequest")
+            header("User-Agent", Up.UA_CLI)
+            header("Authorization", "Bearer ${auth.access_token}")
+        }.build()
+        return runCatching {
+            verifyHttp.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                val uid = runCatching {
+                    AppJson.parseToJsonElement(text).jsonObject["data"]?.objOrNull()
+                        ?.str("uid", "userId", "user_id", "uin").orEmpty()
+                }.getOrDefault("")
+                AuthProbe(resp.code, text, uid, url)
+            }
+        }.getOrElse { e -> AuthProbe(0, e.message ?: "err", "", url) }
     }
 
     private fun chatCallSingle(base: String, realm: String, auth: AuthEntry): HttpResult {
@@ -1998,7 +2218,14 @@ object Classify {
     private val promptTooLongMarkers = listOf("11115", "prompt is too long", "context length")
     private val invalidImageMarkers = listOf("11133", "invalid image", "image format", "unsupported image", "图片格式")
     /** 请求体解析失败（HTTP 400 + `"code":11101` / "Unmarshal chat params failed"）→ 请求级确定性错误。 */
-    private val badParamsMarkers = listOf("11101", "unmarshal chat params failed")
+    private val badParamsMarkers = listOf(
+        "11101", "unmarshal chat params failed",
+        // 上游 2026-11 新登记的工具调用类请求级错误：换号也没用（同一份 tools/历史发给任何号
+        // 都会被同样拒绝），必须归「请求级零动作」，否则会被记成账号连败 → 连坐降权/禁用。
+        "11129", "invalid function call parameters",  // tools schema 关键字类型不合法（#251/#266）
+        "11148",                                       // 工具结果早于调用（历史配对错位，#253）
+        "11152",                                       // 顶层 $ref / schema 关键字类型（2026-11-18）
+    )
 
     /**
      * 渠道校验拦截的业务码。上游有**两种**编码形态，必须都认：
