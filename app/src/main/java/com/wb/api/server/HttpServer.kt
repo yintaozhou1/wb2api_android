@@ -241,6 +241,9 @@ class EmbeddedHttpServer(
     @Volatile private var executor: ExecutorService? = null
 
     /** 活跃连接的写探针（见 [WriteGuard]）；handle() 结束时移除。 */
+    /** 过载时异步写 503 的并发上限（见 accept 循环里的拒绝分支）。 */
+    private val rejectWriters = java.util.concurrent.atomic.AtomicInteger(0)
+
     private val guards = java.util.concurrent.ConcurrentHashMap.newKeySet<WriteGuard>()
 
     /** 写侧看门狗（5s 一轮，只 close 真正卡住的那条连接）。 */
@@ -345,15 +348,31 @@ class EmbeddedHttpServer(
             try {
                 ex.execute { handle(sock) }
             } catch (e: java.util.concurrent.RejectedExecutionException) {
-                runCatching {
-                    Res(sock.getOutputStream()).sendError(
-                        503,
-                        "gateway busy: too many concurrent connections",
-                        "server_busy",
-                        "并发连接已达上限（$HTTP_MAX_THREADS），请稍后重试",
-                    )
+                // ⚠️ 这里跑在 **accept 线程** 上。Java 没有 socket 写超时：对一条半开连接写
+                // 503 可能阻塞到内核重传耗尽（分钟级），accept 循环随之停摆、新连接全堆在
+                // 内核 backlog —— 表面症状与「网关假死」一致。
+                // 因此：写响应一律交给独立线程（限 4 个，避免过载时线程爆炸），
+                // 拿不到名额就只关连接（客户端会按服务不可用重试，语义与 503 等价）。
+                if (rejectWriters.get() < 4) {
+                    rejectWriters.incrementAndGet()
+                    Thread {
+                        try {
+                            runCatching {
+                                Res(sock.getOutputStream()).sendError(
+                                    503,
+                                    "gateway busy: too many concurrent connections",
+                                    "server_busy",
+                                    "并发连接已达上限（$HTTP_MAX_THREADS），请稍后重试",
+                                )
+                            }
+                        } finally {
+                            runCatching { sock.close() }
+                            rejectWriters.decrementAndGet()
+                        }
+                    }.apply { isDaemon = true; name = "wb-reject" }.start()
+                } else {
+                    runCatching { sock.close() }
                 }
-                runCatching { sock.close() }
             }
         }
     }
@@ -617,6 +636,11 @@ class Router {
             put("success_count", JsonPrimitive(v.success_count))
             put("err_total", JsonPrimitive(v.err_total))
             put("access_expires_at", JsonPrimitive(v.access_expires_at))
+            // 续期能力也报给面板：只有 access_expires_at 时，面板无法区分「过期但能续」
+            // 与「续期凭证也失效」，而这正是两种完全不同的处置。
+            put("refresh_expires_at", JsonPrimitive(v.refresh_expires_at))
+            put("has_refresh", JsonPrimitive(v.has_refresh))
+            put("credential_state", JsonPrimitive(v.credentialState().name))
             put("rate_limited_models", buildJsonArray {
                 v.rate_limited_models.forEach { m ->
                     add(buildJsonObject {

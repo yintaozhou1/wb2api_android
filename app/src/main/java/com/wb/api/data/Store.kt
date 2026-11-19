@@ -123,7 +123,13 @@ class Store(private val context: Context) {
                 if (e.uid.isNotBlank()) fresh[e.uid] = e
             }.onFailure { LogBus.log("[sys] 读取账号失败 ${f.name}: ${it.message}") }
         }
-        authCache.putAll(fresh)
+        // 不能直接 putAll：续期刚写进内存、磁盘尚未落盘（或落盘失败）时，reload 会用
+        // 磁盘上的旧 refresh_token 把新凭证冲掉 —— 上游已轮换 RT，下次刷新 4xx → 判死。
+        // 规则：磁盘条目只有在「不旧于内存」时才覆盖（updated_at 相同也覆盖，等价内容）。
+        fresh.forEach { (uid, e) ->
+            val cur = authCache[uid]
+            if (cur == null || e.updated_at >= cur.updated_at) authCache[uid] = e
+        }
         authCache.keys.retainAll(fresh.keys)
         return authCache.values.toList()
     }

@@ -102,7 +102,6 @@ object SseSplit {
             if (runCatching { AppJson.parseToJsonElement(part) }.isFailure) return emptyList()
             out += part
             if (out.size > MAX_PARTS) return emptyList()
-            if (end <= start) return emptyList()
             i = end
         }
         return out

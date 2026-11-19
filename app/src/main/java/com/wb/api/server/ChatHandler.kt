@@ -10,6 +10,7 @@ import com.wb.api.core.Ids
 import com.wb.api.core.LogBus
 import com.wb.api.model.AuthEntry
 import com.wb.api.model.UsageRecord
+import com.wb.api.upstream.CredentialService
 import com.wb.api.upstream.Classify
 import com.wb.api.upstream.ConvIds
 import com.wb.api.upstream.SessionProof
@@ -255,6 +256,17 @@ object ChatHandler {
                     break
                 }
                 tried += auth.uid
+                // 凭证确定不可用（无 AT/RT，或 AT 已过期且 RT 也按本地记录过期）：直接跳过这一跳。
+                // 之前这类号会被选中、白撞一次 401 再触发求证与冷却 —— 用户看到的是「号在，
+                // 但每次请求都失败得莫名其妙」，账号页却显示「可用」。
+                if (Gateway.pool.credentialDead(auth)) {
+                    LogBus.log(
+                        "$realm|$model 跳过凭证不可用的号 uid=${auth.uid.take(8)}" +
+                            "（${com.wb.api.model.CredentialHealth.of(auth)}）-> 换号",
+                    )
+                    attempt++
+                    continue
+                }
                 // 临期先续（避免把「token 自然过期」当成账号故障走一遍 401 求证）。
                 val live = ensureFreshToken(auth)
                 Gateway.pool.acquire(live.uid)
@@ -280,7 +292,10 @@ object ChatHandler {
                         // HttpServer 的兜底 catch，变成一条匿名 500 —— 该号不被罚、也不换号，
                         // 而 bodyStreamOf 的注释恰恰声称「可被上层按服务器错误处置」。
                         hop = try {
-                            responder(res, resp, auth, model, realm, req, reqId, start)
+                            // 必须传 live：实际发出的是 live.access_token（可能刚续期）。
+                            // 传旧 auth 会让 401 求证把 live 的更新误判成「别的线程刷过」→
+                            // 真死的 token 永远判不出来（只有 30s 软冷却，最后 503）。
+                            responder(res, resp, live, model, realm, req, reqId, start)
                         } catch (e: UpstreamException) {
                             LogBus.log("$realm|$model responder 异常 uid=${auth.uid.take(8)} kind=${e.kind}: ${e.message}")
                             Gateway.pool.onTransportFailure(auth.uid, model, e.message ?: "responder")
@@ -301,6 +316,13 @@ object ChatHandler {
                             httpOk = true
                             Gateway.pool.clearModelBlock(auth.uid, model)
                             Gateway.pool.stickyBind(sessionKey ?: reqId, auth.uid)
+                            return
+                        }
+                        // 首帧 error 帧里的**请求级**错误（参数非法 / 内容拦截 / 提示词过长 / 图片不合法）：
+                        // 换号也救不了（同一份请求发给任何号都会被同样拒绝），立即按原状态码回给客户端。
+                        // 旧行为是烧完 MAX_ROTATE 次轮转再统一回 503，用户白等、上游白打（上游 11-17 修复）。
+                        if (!hop.sent && hop.errKind in failFastKinds) {
+                            mapError(res, hop.errKind, hop.errBody, model, false, realm)
                             return
                         }
                         // 失败但**尚未向客户端发送任何数据**（首帧前上游断流 / 首帧即 error 帧）：
@@ -338,8 +360,6 @@ object ChatHandler {
                         // 另一个账号，上游前缀缓存全量 miss（「报错一次，缓存就再也不生效」，
                         // 上游 2026-11 的修复口径）。这类错误直接按原状态码回给客户端。
                         if (kind in failFastKinds) { mapError(res, kind, lastBody, model, false, realm); return }
-                        Gateway.pool.stickyUnbind(sessionKey ?: reqId)
-                        LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
                         // 6020 带 data.retry_after（实测 40s，通道级口径：队列按 client_user_type
                         // 全局共享）时**不再换号**：上游已给出「N 秒后重试」，这几毫秒内换号必然撞
                         // 同一堵墙，只是把同一份排队请求多发 MAX_ROTATE 次（上游 issue #125）。
@@ -355,6 +375,11 @@ object ChatHandler {
                                 return
                             }
                         }
+                        // 只有「确实要换号」才解绑：放到这里而不是上面，是为了让「6020 不换号」
+                        // 这类分支保住会话粘性 —— 否则客户端 40s 后重试会换号，前缀缓存全量 miss，
+                        // 与上一段注释的初衷自相矛盾。
+                        Gateway.pool.stickyUnbind(sessionKey ?: reqId)
+                        LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
                     }
                 } finally {
                     Gateway.pool.release(auth.uid)
@@ -427,6 +452,7 @@ object ChatHandler {
             if (uid != null && uid !in tried) {
                 val a = Gateway.store.getAuth(uid)
                 if (a != null && a.realm == realm &&
+                    !Gateway.pool.credentialDead(a) &&
                     Gateway.pool.healthyForModel(uid, model) &&
                     !Gateway.pool.inFlightFull(uid, realm)) {
                     return a
@@ -804,12 +830,15 @@ object ChatHandler {
                         emitCalls(fed.second)
                         frameEl = rewriteContent(frameEl, fed.first)
                     }
-                    // 记录本帧真实调用的 index（在 emitCalls 之后更新，与上游 writeChunk 的时序一致）
-                    ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.let { arr ->
-                        if (arr.isNotEmpty()) sawToolCall = true
-                    }
-                    ((ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray)?.forEach { t ->
-                        t.objOrNull()?.get("index")?.primText()?.toIntOrNull()?.let { if (it > maxToolIdx) maxToolIdx = it }
+                    // 记录本帧真实调用的 index（在 emitCalls 之后更新，与上游 writeChunk 的时序一致）。
+                    // 只取一次数组：原来同一表达式强转两遍并各遍历一次（每帧多两次 JSON 节点查找）。
+                    val frameCalls = (ch?.get("delta") as? JsonObject)?.get("tool_calls") as? JsonArray
+                    if (frameCalls != null && frameCalls.isNotEmpty()) {
+                        sawToolCall = true
+                        frameCalls.forEach { t ->
+                            t.objOrNull()?.get("index")?.primText()?.toIntOrNull()
+                                ?.let { if (it > maxToolIdx) maxToolIdx = it }
+                        }
                     }
                     val norm = normalizeFrame(frameEl, firstId, seenToolNames)
                     firstId = norm.first
@@ -1056,7 +1085,9 @@ object ChatHandler {
             if (reasoning.isNotEmpty()) put("reasoning_content", JsonPrimitive(reasoning.toString()))
         }
         val pt = if (usage.prompt > 0) usage.prompt else (String(req.body).length / 4).toLong()
-        val ct = if (usage.completion > 0) usage.completion else content.length.toLong()
+        // 兜底估算必须与 prompt 侧同口径：上游没给 usage 时按「4 字符 ≈ 1 token」估，
+        // 原来 completion 直接用字符数，会把口径放大 4 倍（面板的 token 与速率随之失真）。
+        val ct = if (usage.completion > 0) usage.completion else (content.length / 4).toLong()
         val tt = if (usage.total > 0) usage.total else pt + ct
         val out = buildJsonObject {
             put("id", JsonPrimitive(id))
@@ -1223,19 +1254,7 @@ object ChatHandler {
      * 二次读取最新 token：如果别的线程已经刷新成功（access_token 变了），本次 401 就是
      * 旧 token 造成的，直接判健康、不再重复打 refresh。
      */
-    private val sessionLocks = java.util.concurrent.ConcurrentHashMap<String, Any>()
-
-    private fun proveSession(auth: AuthEntry): SessionProof {
-        val lock = sessionLocks.computeIfAbsent(auth.uid) { Any() }
-        return synchronized(lock) {
-            val latest = runCatching { Gateway.store.getAuth(auth.uid) }.getOrNull() ?: auth
-            if (latest.access_token.isNotBlank() && latest.access_token != auth.access_token) {
-                return@synchronized SessionProof(SessionVerdict.ALIVE, null)
-            }
-            runCatching { runBlocking { Gateway.upstream.verifySession(latest) } }
-                .getOrDefault(SessionProof(SessionVerdict.UNKNOWN))
-        }
-    }
+    private fun proveSession(auth: AuthEntry): SessionProof = CredentialService.prove(auth)
 
     /**
      * 主动续期：access token 在本端是 **1 小时固定到期**（刷新响应不带 expiresIn 时按 3600
@@ -1243,7 +1262,7 @@ object ChatHandler {
      *
      * 只在临期 120s 内动作；刷新失败就按原凭证继续（那条 401 路径会兜住）。
      *
-     * **必须与 401 求证共用同一把 uid 锁**（[sessionLocks]）：token 到期那一刻，
+     * **必须与 401 求证共用同一把 uid 锁**（见 [com.wb.api.upstream.CredentialService.withUidLock]）：token 到期那一刻，
      * `max_in_flight` 个并发请求会**同时**命中临期分支，各自拿同一份旧 RT 去刷 ——
      * 上游轮换 refresh_token 后，后到的几条必然 4xx，被 `proveSession` 判 DEAD 后
      * 就把一个健康号永久禁用了（与 1.6.7 修掉的是同一个误杀，只是从另一个入口复发）。
@@ -1252,20 +1271,9 @@ object ChatHandler {
     private fun ensureFreshToken(auth: AuthEntry): AuthEntry {
         if (auth.refresh_token.isBlank() || auth.access_expires_at <= 0) return auth
         if (auth.access_expires_at - System.currentTimeMillis() / 1000 > 120) return auth
-        val lock = sessionLocks.computeIfAbsent(auth.uid) { Any() }
-        return synchronized(lock) {
-            val latest = runCatching { Gateway.store.getAuth(auth.uid) }.getOrNull() ?: auth
-            val now = System.currentTimeMillis() / 1000
-            if (latest.access_expires_at - now > 120) {
-                // 别的线程刚刷过（或本地凭证已被更新）：直接用最新的，不再打 refresh。
-                return@synchronized latest
-            }
-            val renewed = runCatching { runBlocking { Gateway.upstream.refresh(latest) } }.getOrNull()
-                ?: return@synchronized auth
-            Gateway.store.saveAuth(renewed)
-            LogBus.log("| token 临期（${latest.access_expires_at - now}s），已主动续期 uid=${auth.uid.take(8)}")
-            renewed
-        }
+        // 续期/落盘/单飞统一在 CredentialService（1.7.4 起：保活巡检、自检、面板批量都会
+        // 触发续期，锁必须共用一份，否则并发轮换 refresh_token 会把健康号判死）。
+        return CredentialService.renew(auth, minRemainingSec = 120) ?: auth
     }
 
     private fun mapError(
@@ -1930,7 +1938,9 @@ object ChatHandler {
             }
 
             val pt = if (usage.prompt > 0) usage.prompt else (String(req.body).length / 4).toLong()
-            val ct = if (usage.completion > 0) usage.completion else content.length.toLong()
+            // 兜底估算必须与 prompt 侧同口径：上游没给 usage 时按「4 字符 ≈ 1 token」估，
+            // 原来 completion 直接用字符数，会把口径放大 4 倍（面板的 token 与速率随之失真）。
+            val ct = if (usage.completion > 0) usage.completion else (content.length / 4).toLong()
             val tt = if (usage.total > 0) usage.total else pt + ct
             // 与 chat 路径同口径（见 [isTruncatedArgs] / Go upstream/truncation.go）：截断时
             // 丢弃 arguments 残缺的 tool_call（原样下发非法 JSON 会让客户端卡死会话），并把
