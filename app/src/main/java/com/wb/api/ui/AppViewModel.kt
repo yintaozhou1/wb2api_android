@@ -190,8 +190,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             lastError = Gateway.lastError.value,
             lanIp = Net.lanIp(),
             creditsTotal = views.sumOf { if (it.credits >= unlimited) 0.0 else it.credits },
-            creditsAccounts = views.count { it.credits < unlimited },
-            creditsUnlimited = views.any { it.credits >= unlimited },
+            // 计数也要排除禁用号：金额已经把它们的 credits 置 0，计数再算进去就会出现
+            // 「合计 0 · 3 个账号」这种自相矛盾的口径（全池禁用时应显示「暂无余额数据」）。
+            creditsAccounts = views.count { !it.disabled && it.credits < unlimited },
+            creditsUnlimited = views.any { !it.disabled && it.credits >= unlimited },
             creditConsumed = Gateway.pool.sessionCreditConsumed(),
         )
     }
@@ -555,7 +557,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             Gateway.pool.markCheckin(a.uid)
                             if (v == "已签到") already++ else ok++
                         }
-                        else -> ok++
+                        // 未知返回值（上游改了回执形态）不能算成功：否则「手动签到」的汇总
+                        // 会把失败报成「成功 N」，用户以为签上了、其实没有。
+                        else -> {
+                            fail++
+                            LogBus.log("[task] 签到 ${a.nickname.ifBlank { a.uid.take(8) }}: 未知回执 $v")
+                        }
                     }
                 }
                 .onFailure {
@@ -620,13 +627,53 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 网络自检：逐域名/路径探测上游并写入日志，便于定位不可达的 host。 */
+    /**
+     * 网络 / 凭证自检。
+     *
+     * 1.7.4 起自检做**真实动作**（临期先续期 → 用 Bearer 验证 AT → 查余额 → 探模型目录），
+     * 结论直接回答「这个号现在能不能用、还剩多久、要不要重新登录」，而不是「token=有」。
+     * 自检过程中得到的结论会写回系统：续期成功 → 落盘并入池；确认失效 → 标记 session dead。
+     */
     fun diagnose(uid: String) = ioAsync("网络自检") {
         val a = Gateway.store.getAuth(uid) ?: return@ioAsync "账号不存在"
         val report = runCatching { Gateway.upstream.diagnose(a) }
-            .getOrElse { "自检异常：${it.message}" }
-        report.lineSequence().forEach { LogBus.log("[diag] $it") }
-        report.lineSequence().firstOrNull() ?: "自检完成"
+            .getOrElse { return@ioAsync "自检异常：${it.message}" }
+        report.renewed?.let {
+            Gateway.store.saveAuth(it)
+            Gateway.pool.reload()
+        }
+        if (report.dead) Gateway.pool.markSessionDead(uid)
+        report.lines.forEach { LogBus.log("[diag] $it") }
+        report.verdict
+    }
+
+    /**
+     * 立即续期（详情页按钮）。
+     *
+     * 与定时保活的区别：**强制**触发一次 refresh，不看「还剩多久」——用户点它就是要现在续。
+     * 仍然要求 RT 存在且未被判死，否则直接给「请重新登录」而不是打一次注定失败的请求。
+     */
+    fun renewCredential(uid: String) = ioAsync("续期") {
+        val a = Gateway.store.getAuth(uid) ?: return@ioAsync "账号不存在"
+        if (a.refresh_token.isBlank()) return@ioAsync "没有续期凭证，请重新登录"
+        val r = runCatching { Gateway.upstream.keepalive(a, force = true) }
+            .getOrElse { return@ioAsync "续期失败：${it.message}" }
+        r.renewed?.let {
+            Gateway.store.saveAuth(it)
+            Gateway.pool.reload()
+        }
+        if (r.state == "dead") {
+            Gateway.pool.markSessionDead(uid)
+            return@ioAsync "续期凭证已失效，请重新登录"
+        }
+        r.message
+    }
+
+    /** 全部保活（设置页 / 面板同款动作）：把每个能续的号都续一次。 */
+    fun keepaliveAll() = ioAsync("全部保活") {
+        val n = com.wb.api.scheduler.Scheduler.keepaliveAll(force = true)
+        if (n > 0) Gateway.pool.reload()
+        if (n == 0) "没有需要续期的账号" else "已续期 $n 个账号"
     }
 
     private fun io(block: () -> String) {

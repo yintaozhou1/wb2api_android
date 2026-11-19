@@ -76,6 +76,8 @@ import com.wb.api.core.LogChannel
 import com.wb.api.core.LogEntry
 import com.wb.api.core.LoggingCfg
 import com.wb.api.core.Mask
+import com.wb.api.model.CredentialHealth
+import com.wb.api.model.CredentialState
 import com.wb.api.core.PoolCfg
 import com.wb.api.core.PrettyJson
 import com.wb.api.core.ScheduleCfg
@@ -727,18 +729,10 @@ private fun AccountCard(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
-    val statusColor = when {
-        a.disabled -> WbPalette.danger
-        a.paused -> WbPalette.info
-        a.cool_remaining_sec > 0 -> WbPalette.warn
-        else -> WbPalette.ok
-    }
-    val statusText = when {
-        a.disabled -> "已禁用"
-        a.paused -> "已暂停选号"
-        a.cool_remaining_sec > 0 -> "冷却中"
-        else -> "可用"
-    }
+    // 状态统一由 accountStatus 派生（池状态 + 凭证健康度），不再在这里各写一份 when：
+    // 之前只看池状态，凭证过期/失效的号照样显示绿色「可用」。
+    val status = accountStatus(a)
+    val statusColor = status.color()
     val haptics = LocalHapticFeedback.current
     val animOn = LocalWbAnimations.current
     // 勾选指示器：选中时从 0 弹到 1（关动画偏好时直接到位）。
@@ -815,7 +809,7 @@ private fun AccountCard(
                     }
                 } else {
                     Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(WbD.gapXs)) {
-                        WbPill(statusText, statusColor)
+                        WbPill(status.label, statusColor)
                         WbPill(if (a.realm == "global") "GLOBAL" else "CN", if (a.realm == "global") WbPalette.info else MiuixTheme.colorScheme.primary)
                         // 企业版没有个人成长体系（签到等一律被上游拒绝）：标出来，避免被误当成异常。
                         if (a.enterprise) WbPill("企业版", WbPalette.warn)
@@ -830,7 +824,8 @@ private fun AccountCard(
             WbRow(
                 "详情 / 操作",
                 when {
-                    a.cool_remaining_sec > 0 -> "冷却剩余 ${Durations.format(a.cool_remaining_sec)}${if (a.cool_kind.isNotBlank()) " (${a.cool_kind})" else ""}"
+                    // 凭证/冷却这类「需要用户知道」的信息优先；正常账号回落到在途/速率。
+                    status.detail.isNotBlank() -> status.detail
                     a.in_flight > 0 -> "在途 ${a.in_flight}"
                     else -> "近期速率 ${rateText(a)}"
                 },
@@ -869,12 +864,11 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
         WbEmpty("账号不存在或已被移除")
         return
     }
-    val statusColor = when {
-        v.disabled -> WbPalette.danger
-        v.paused -> WbPalette.info
-        v.cool_remaining_sec > 0 -> WbPalette.warn
-        else -> WbPalette.ok
-    }
+    val nowSec = System.currentTimeMillis() / 1000
+    val status = accountStatus(v, nowSec)
+    val statusColor = status.color()
+    val credState = v.credentialState(nowSec)
+    val credLeft = CredentialHealth.remainingSec(v.access_expires_at, nowSec)
     val checkedIn = v.last_checkin_at >= todayStartSec()
     // 「复制登录凭证」= 敏感内容，统一走 SecretClipboard（会给 ClipDescription 打
     // EXTRA_IS_SENSITIVE，系统复制预览与输入法剪贴板面板都不显示 access_token 明文）。
@@ -900,15 +894,7 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
                         }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(WbD.gapS)) {
-                        WbPill(
-                            when {
-                                v.disabled -> "已禁用"
-                                v.paused -> "已暂停选号"
-                                v.cool_remaining_sec > 0 -> "冷却中"
-                                else -> "正常"
-                            },
-                            statusColor,
-                        )
+                        WbPill(status.label, statusColor)
                         WbPill(if (v.realm == "global") "GLOBAL" else "CN", if (v.realm == "global") WbPalette.info else MiuixTheme.colorScheme.primary)
                         if (v.enterprise) WbPill("企业版", WbPalette.warn)
                         // 企业版没有成长体系、签到会被上游 400 拒绝：不能显示「今日未签到」，
@@ -937,7 +923,15 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
         }
         item {
             WbSection("额度与用量") {
-                WbRow("剩余积分", wbCreditsText(v.credits), showDivider = true)
+                WbRow(
+                    "剩余积分",
+                    if (v.disabled && v.credits_frozen > 0) {
+                        "0（禁用前冻结 ${wbCreditsText(v.credits_frozen)}，不计入可用合计）"
+                    } else {
+                        wbCreditsText(v.credits)
+                    },
+                    showDivider = true,
+                )
                 WbRow("总额度", wbCreditsText(v.credits_total), showDivider = true)
                 WbRow("成功 / 失败", "${v.success_count} / ${v.err_total}", showDivider = true)
                 WbRow("最近耗时", if (v.token_usage.last_latency_ms > 0) "${v.token_usage.last_latency_ms} ms" else "—", showDivider = true)
@@ -972,9 +966,26 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
                 WbRow("冷却剩余", if (v.cool_remaining_sec > 0) Durations.format(v.cool_remaining_sec) else "无", showDivider = true)
                 WbRow("冷却类型", v.cool_kind.ifBlank { "—" }, showDivider = true)
                 WbRow("熔断失败次数", "${v.breaker_fail_streak}", showDivider = true)
+                // 凭证状态：把「还剩多久」与「能不能续」合成一句话。
+                // 旧实现只显示「3 分 12 秒」，用户看不出「过 0 点就废了、能不能救」。
                 WbRow(
-                    "令牌到期",
-                    if (v.access_expires_at > 0) Durations.format(v.access_expires_at - System.currentTimeMillis() / 1000) else "—",
+                    "凭证状态",
+                    CredentialHealth.describe(credState, credLeft),
+                    valueColor = when (credState) {
+                        CredentialState.REFRESH_EXPIRED, CredentialState.MISSING -> WbPalette.danger
+                        CredentialState.ACCESS_EXPIRED, CredentialState.EXPIRING -> WbPalette.warn
+                        else -> null
+                    },
+                    showDivider = true,
+                )
+                WbRow(
+                    "续期凭证",
+                    when {
+                        !v.has_refresh -> "无（令牌到期后需重新登录）"
+                        v.refresh_expires_at > 0 ->
+                            "有 · 约 ${CredentialHealth.fmt((v.refresh_expires_at - nowSec).coerceAtLeast(0))}"
+                        else -> "有"
+                    },
                     showDivider = true,
                 )
                 WbRow("在途请求", "${v.in_flight}", showDivider = v.rate_limited_models.isNotEmpty())
@@ -1025,8 +1036,19 @@ fun AccountDetailScreen(v: AccountView?, vm: AppViewModel, onRemoved: () -> Unit
                             )
                         }
                     }
+                    // 只在「有续期凭证且确实临期/过期」时给按钮：正常号不需要，失效号点了也没用。
+                    if (status.action == AccountStatus.Action.Renew) {
+                        WbButton(
+                            "立即续期",
+                            onClick = { vm.renewCredential(v.uid) },
+                            modifier = Modifier.fillMaxWidth(),
+                            variant = WbButtonVariant.Tonal,
+                            icon = MiuixIcons.Refresh,
+                        )
+                    }
                     WbButton("解除冷却 / 熔断", onClick = { vm.revive(v.uid) }, modifier = Modifier.fillMaxWidth(), variant = WbButtonVariant.Tonal, icon = MiuixIcons.Refresh)
-                    WbTextButton("网络自检（结果写入日志）", onClick = { vm.diagnose(v.uid) }, modifier = Modifier.fillMaxWidth())
+                    // 自检现在会直接回结论（可用/已续期/需重新登录），明细仍进日志。
+                    WbTextButton("网络与凭证自检", onClick = { vm.diagnose(v.uid) }, modifier = Modifier.fillMaxWidth())
                     // 登录凭证（复制）：JSON 与上游 cockpitAccount 同名字段，可再粘回「添加账号 → 导入登录凭证」。
                     WbHintBlock(
                         title = "登录凭证属敏感信息",
@@ -1641,6 +1663,13 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                         }
                     }
                     WbSwitchRow(
+                        title = "凭证券活",
+                        summary = "访问令牌快到期时自动续期（15 分钟巡检一次），" +
+                            "避免账号闲置一天后第一个请求先撞 401",
+                        checked = draft.schedule.keepalive_enabled,
+                        onCheckedChange = { draft = draft.copy(schedule = draft.schedule.copy(keepalive_enabled = it)) },
+                    )
+                    WbSwitchRow(
                         title = "余额自动刷新",
                         summary = "定时同步账号剩余积分",
                         checked = draft.schedule.balance_refresh_enabled,
@@ -1747,8 +1776,7 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                             title = "为什么有的任务一直「进行中」",
                             body = "需要真实对话的任务（Model_chat / skill / 专家链路 / 小程序 mini chat）" +
                                 "不做脚本化上报：上游按真人节奏与真实会话校验，数秒级连发会被整体回滚。" +
-                                "这类任务请直接在官方客户端完成；猫猫旅行与 token 保活尚未接入上游接口，" +
-                                "开关保留但不执行。",
+                                "这类任务请直接在官方客户端完成；猫猫旅行尚未接入上游接口，开关保留但不执行。",
                             icon = MiuixIcons.Info,
                         )
                     }
