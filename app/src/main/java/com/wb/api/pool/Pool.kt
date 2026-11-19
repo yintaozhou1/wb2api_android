@@ -5,6 +5,8 @@ import com.wb.api.core.GatewayConfig
 import com.wb.api.core.LogBus
 import com.wb.api.data.Store
 import com.wb.api.model.AccountState
+import com.wb.api.model.AuthEntry
+import com.wb.api.model.CredentialHealth
 import com.wb.api.model.ModelLimit
 import com.wb.api.model.StickyBind
 import com.wb.api.model.TokenUsage
@@ -37,7 +39,10 @@ data class AccountView(
     val cool_remaining_sec: Long,
     val cool_kind: String,
     val in_flight: Int,
+    /** 当前**可用**积分（禁用号一律为 0，见 [credits_frozen]）。 */
     val credits: Double,
+    /** 禁用时的冻结快照（仅用于详情页展示「封禁前还剩多少」）。 */
+    val credits_frozen: Double = 0.0,
     val credits_total: Double,
     val success_count: Long,
     val err_total: Long,
@@ -45,8 +50,28 @@ data class AccountView(
     val model_costs: Map<String, Double>,
     val token_usage: TokenUsage,
     val access_expires_at: Long,
+    /** 续期凭证的估算到期时刻（epoch 秒，0 = 未知）；仅供 UI 提示「续期能力」，不参与选号。 */
+    val refresh_expires_at: Long = 0,
+    /** 是否还持有 access_token（**不要**用「到期时间 > 0」反推：导入/手写凭证可能没有到期时间）。 */
+    val has_access: Boolean = true,
+    /** 是否还持有 refresh_token（没有就只能在 AT 到期后重新登录）。 */
+    val has_refresh: Boolean = true,
     val last_checkin_at: Long,
-)
+) {
+    /**
+     * 凭证健康度（UI / 详情页共用）。
+     *
+     * 判定口径全部在 [CredentialHealth] 里，UI 不再自己拼 `when` —— 这是 1.7.4 修掉
+     * 「过期仍显示可用」的关键：状态必须由数据派生，而不是由「字段非空」推断。
+     */
+    fun credentialState(nowSec: Long = System.currentTimeMillis() / 1000) = CredentialHealth.ofFlags(
+        hasAccess = has_access,
+        accessExpiresAt = access_expires_at,
+        hasRefresh = has_refresh,
+        refreshExpiresAt = refresh_expires_at,
+        nowSec = nowSec,
+    )
+}
 
 @androidx.compose.runtime.Immutable
 data class PoolCounts(
@@ -99,7 +124,10 @@ class AccountPool(
     fun reload() {
         store.loadAuths()
         val st = store.loadState()
-        sticky.clear(); sticky.putAll(st.sticky)
+        // 不能 clear 后再 putAll：续期/保活会频繁 reload，而 sticky 落盘是节流的 ——
+        // 清空会把「刚绑定、尚未落盘」的会话粘性丢掉，表现为「缓存命中率周期性归零」。
+        // 已删除的条目由 stickyGC 按 TTL 清理（粘性本就是 best-effort）。
+        sticky.putAll(st.sticky)
         recoverChannelBlocked()
         LogBus.log("loaded ${store.auths().size} account(s)")
     }
@@ -189,7 +217,11 @@ class AccountPool(
             val s = store.stateOf(a.uid)
             // 禁用与「暂停选号」都不参与选号（对齐 Go entry.healthy：disabled || paused）。
             // 注意：这一层过滤同时决定了下面全冷却兜底的候选集 —— 暂停号不会走兜底。
-            a.realm == realm && a.uid !in tried && !s.disabled && !s.paused
+            a.realm == realm && a.uid !in tried && !s.disabled && !s.paused &&
+                // 凭证确定不可用（无 AT 且无 RT / AT 过期且无 RT）的号直接不进候选集。
+                // 放在这里而不是 handler 里「选中后再跳过」：后者会空转轮转次数，
+                // 池里有 3 个死号时健康号一次都轮不到（最终还会报 no_healthy_account）。
+                !credentialDead(a)
         }
         val candidates = pool.filter { a ->
             !cooling(store.stateOf(a.uid)) && inFlightOf(a.uid) < max
@@ -247,7 +279,11 @@ class AccountPool(
     }
 
     fun release(uid: String) {
-        inFlight[uid]?.let { if (it.decrementAndGet() < 0) it.set(0) }
+        // 原子地「递减并在归零时移除」：先 decrementAndGet 再按需 set(0) 是非原子的，
+        // 并发下可能把另一个线程刚 acquire 的计数一起清零；条目永不移除则账号删掉后仍常驻。
+        inFlight.computeIfPresent(uid) { _, v ->
+            if (v.decrementAndGet() <= 0) null else v
+        }
     }
 
     fun onSuccess(
@@ -743,24 +779,6 @@ class AccountPool(
         return PoolCounts(all.size, healthy, cooling, disabled, full, paused)
     }
 
-    fun countsByRealm(realm: String): PoolCounts {
-        val all = store.auths().filter { it.realm == realm }
-        var healthy = 0; var cooling = 0; var disabled = 0; var full = 0; var paused = 0
-        all.forEach { a ->
-            val s = store.stateOf(a.uid)
-            when {
-                s.disabled || s.paused -> {
-                    disabled++
-                    if (s.paused) paused++
-                }
-                cooling(s) -> cooling++
-                inFlightOf(a.uid) >= realmMaxInFlight(a.realm) -> full++
-                else -> healthy++
-            }
-        }
-        return PoolCounts(all.size, healthy, cooling, disabled, full, paused)
-    }
-
     /**
      * 是否有可服务的账号。
      *
@@ -780,7 +798,7 @@ class AccountPool(
     /**
      * 该域当前是否可服务（与 [servableNow] 同口径，只按 realm 过滤）。
      *
-     * `/healthz` 的 realm_servable 曾用 `countsByRealm().healthy > 0`：全部号处于冷却时
+     * `/healthz` 的 realm_servable 曾用「按域统计的健康数 > 0」：全部号处于冷却时
      * 顶层 healthy=200 而 realm_servable=false —— 监控按域误判不可用，与 servableNow
      * 「冷却中但 pick 仍能兜底」的既有结论自相矛盾。
      */
@@ -805,10 +823,19 @@ class AccountPool(
                 disabled = s.disabled, paused = s.paused, enterprise = a.isEnterprise,
                 breaker_until = s.breaker_until, breaker_fail_streak = s.breaker_fail_streak,
                 degrade_until = s.degrade_until, cool_remaining_sec = coolRemaining, cool_kind = s.cool_kind,
-                in_flight = inFlightOf(a.uid), credits = s.credits, credits_total = s.credits_total,
+                in_flight = inFlightOf(a.uid),
+                // 禁用号的余额是**冻结快照**，不代表当前可用量（上游 2026-11 口径：一个封禁
+                // 三周仍显示 4552 的号，会让「总额 / 积分保底 / 路由排序」全部建立在死数据上）。
+                // 暂停号不受影响：它照常保号、余额仍会刷新，只是暂不接流量。
+                credits = if (s.disabled) 0.0 else s.credits,
+                credits_frozen = if (s.disabled) s.credits else 0.0,
+                credits_total = s.credits_total,
                 success_count = s.success_count, err_total = s.err_total,
                 rate_limited_models = s.rate_limited_models, model_costs = s.model_costs,
                 token_usage = s.token_usage, access_expires_at = a.access_expires_at,
+                refresh_expires_at = a.refresh_expires_at,
+                has_access = a.access_token.isNotBlank(),
+                has_refresh = a.refresh_token.isNotBlank(),
                 last_checkin_at = s.last_checkin_at,
             )
         }
@@ -863,6 +890,16 @@ class AccountPool(
     }
 
     fun inFlightFull(uid: String, realm: String): Boolean = inFlightOf(uid) >= realmMaxInFlight(realm)
+
+    /**
+     * 凭证层「确定不可服务」：无凭证，或 AT 已过期且 RT 也按本地记录过期。
+     *
+     * 与 [healthyForModel] 的分工：那个判「池状态」（禁用/暂停/冷却/模型限流），
+     * 这个判「凭证本身还能不能用」。选号时两者都要过 —— 否则一个凭证早已失效、
+     * 但池状态干净的号会被选中，白撞一次 401 再触发求证与冷却。
+     */
+    fun credentialDead(a: AuthEntry, nowSec: Long = now()): Boolean =
+        !com.wb.api.model.CredentialHealth.canServe(com.wb.api.model.CredentialHealth.of(a, nowSec))
 
     /**
      * 「此刻选不到号**只是**因为号都在途占满」（对齐上游 `SlotWaitForRealm`，issue #117）。
