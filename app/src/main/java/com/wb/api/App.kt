@@ -23,6 +23,9 @@ class App : Application() {
         if (BuildConfig.DEBUG) installStrictMode()
         CrashHandler.install(this)
         Gateway.init(this)
+        // 冷启动刷新一次额度（每个进程一次，2.5s 后执行；开关在「设置 → 自动化与策略」）。
+        // 放在 init 之后：此时 store 已就绪，而网关是否已启动不影响余额查询。
+        com.wb.api.scheduler.BalanceAutoRefresh.onProcessStart()
         // 一次性 fire-and-forget：只碰 filesDir 与内存里的日志环，不持有任何可泄漏引用
         // （不引用 Activity/View），线程随进程结束而结束，因此用裸线程是安全的。
         Thread({ reportLastCrash() }, "wb2api-crash-report").apply { isDaemon = true }.start()

@@ -145,6 +145,7 @@ class GatewayService : Service() {
 
     override fun onDestroy() {
         Scheduler.stop()
+        com.wb.api.scheduler.BalanceAutoRefresh.stop()
         Gateway.stopServer()
         runCatching { AddressOverlay.hide() }
         sealArchive()

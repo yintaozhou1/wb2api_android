@@ -389,8 +389,7 @@ fun WbCopyRow(label: String, value: String, showDivider: Boolean = false, onCopi
  * 额度文案：企业版「不限量」在池内用 [Up.ENTERPRISE_UNLIMITED_REMAIN]（1<<40）表示，
  * 直接格式化会打印出 1099511627776 —— 这里统一显示成「不限」。
  */
-fun wbCreditsText(v: Double): String =
-    if (v >= Up.ENTERPRISE_UNLIMITED_REMAIN) "不限" else "%.1f".format(v)
+fun wbCreditsText(v: Double): String = Up.creditsText(v)
 
 @Composable
 fun WbStatTile(

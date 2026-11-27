@@ -112,11 +112,19 @@ data class ScheduleCfg(
     val keepalive_hours: List<Int> = listOf(22),
     val checkin_enabled: Boolean = true,
     val growth_enabled: Boolean = true,
-    val travel_enabled: Boolean = true,
+    // 猫猫旅行上游接口未公开，默认关闭（新装用户不再每天两次往日志里写「跳过」）。
+    val travel_enabled: Boolean = false,
     val activity_enabled: Boolean = true,
     val keepalive_enabled: Boolean = true,
     val balance_refresh_enabled: Boolean = true,
-    val balance_refresh_minutes: Int = 5,
+    /**
+     * 「请求后冷静期」秒数（1.7.5 取代 1.7.4 的 `balance_refresh_minutes` 定时刷新）。
+     *
+     * 语义：一次请求**成功结束**后开始倒计时；冷静期内没有新的成功请求才刷新一次额度，
+     * 期间又来了请求就重新计时。可选 5/15/30/60（见 BalanceAutoRefresh.COOLDOWN_CHOICES）。
+     * 旧配置里的 `balance_refresh_minutes` 由 ignoreUnknownKeys 忽略，不会被误读成秒。
+     */
+    val balance_refresh_cooldown: Int = 15,
     val checkin_mode: String = "fixed",
     val checkin_scan_minutes: Int = 30,
     /** 巡检式补签是否在启动网关时立即执行一次（避免刚启动就等 30 分钟）。 */

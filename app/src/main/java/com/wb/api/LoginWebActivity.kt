@@ -483,11 +483,8 @@ class LoginWebActivity : ComponentActivity() {
                         // 「处理中」不记签到时刻（见 isCheckinDone 注释）。
                         .onSuccess { r -> if (Gateway.upstream.isCheckinDone(r)) Gateway.pool.markCheckin(entry.uid) }
                 }
-                val soonSec = com.wb.api.core.Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
-                runCatching { Gateway.upstream.balanceDetailed(entry, soonSec) }
-                    .onSuccess { b ->
-                        if (b.known) Gateway.pool.setCredits(entry.uid, b.remain, b.earliestAt, b.earliestRemaining)
-                    }
+                // 统一走 CreditsService（余额 + 最早到期批次一起写回；失败由它记日志）。
+                com.wb.api.server.CreditsService.refreshOne(entry)
                 Gateway.pool.reload()
                 LogBus.log("[sys] 新账号已加入账号池 uid=${entry.uid} realm=$realm")
             }

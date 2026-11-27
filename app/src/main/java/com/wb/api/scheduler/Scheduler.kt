@@ -1,7 +1,6 @@
 package com.wb.api.scheduler
 
 import com.wb.api.Gateway
-import com.wb.api.core.Durations
 import com.wb.api.core.LogBus
 import com.wb.api.core.ScheduleCfg
 import com.wb.api.model.AuthEntry
@@ -25,15 +24,14 @@ import java.util.concurrent.ConcurrentHashMap
  * 本轮修正的几处逻辑：
  *  1. **空账号直接返回**——原来会「跑一轮、刷一条『完成 0 个账号』日志」，看起来像执行成功；
  *  2. **定点签到 / 巡检补签两种模式**（`checkin_mode`），补齐用户诉求「检测到未签到就自动签到」；
- *  3. 幂等键改为 `任务名-日期-小时`，余额刷新单独用「时间槽」键，不再与小时键共用一张表（原来
- *     两者混用同一 map，清理时会互相误伤）；
+ *  3. 幂等键为 `任务名-日期-小时`，各定时任务互不干扰（余额刷新 1.7.5 起改为**请求驱动**，
+ *     不再走这张表）；
  *  4. 每次 tick 顺手 `pool.flush()`（补写节流的状态）与 `stickyGC()`（清理过期会话粘性）；
  *  5. 未接入上游的扩展任务**如实标记为未实现**，不再假装「已完成」。
  */
 object Scheduler {
     private var job: Job? = null
     private val ranToday = ConcurrentHashMap<String, String>() // key -> 幂等标记
-    private var lastBalanceSlot = -1L
     private var lastCheckinScanMs = 0L
 
     fun start(scope: CoroutineScope) {
@@ -82,21 +80,16 @@ object Scheduler {
             else if (hour in s.checkin_hours) once("checkin", hour) { runBulk("签到") { checkinOne(it) } }
         }
 
-        if (s.balance_refresh_enabled) {
-            val minutes = s.balance_refresh_minutes.coerceAtLeast(1)
-            val slot = System.currentTimeMillis() / (minutes * 60_000L)
-            if (slot != lastBalanceSlot) {
-                lastBalanceSlot = slot
-                // 快过期窗口取自配置（与选号里的加权判据同源，避免两处口径漂移）。
-                val soonSec = Durations.parse(cfg.pool.expiring_soon, 168 * 3600L)
-                runBulk("余额刷新") { a ->
-                    val b = Gateway.upstream.balanceDetailed(a, soonSec)
-                    if (!b.known) throw IllegalStateException("上游未返回余额")
-                    Gateway.pool.setCredits(a.uid, b.remain, b.earliestAt, b.earliestRemaining)
-                    "ok"
-                }
-            }
-        }
+        // 余额刷新（1.7.5）：**不在这里定时跑**。改为「请求后冷静期」事件驱动
+        // （见 BalanceAutoRefresh）：没有请求就没有余额变化，定时刷新纯属空转；
+        // 而用户刚聊完正是最想知道余额的时刻，固定周期反而要等。
+
+        // 余额兜底刷新（1.7.5）：请求驱动的「冷静期刷新」覆盖不到「长时间没有对话」的时段，
+        // 而上游每日发放 / 批次到期与请求无关 —— 完全靠请求驱动会让 credits / earliest_at
+        // 长期陈旧（prefer_expiring 静默失效）。这里保留一条**低频率**兜底：距上次刷新超过
+        // 一小时、且确实有账号余额陈旧时才全量刷一次（远低于原「每 N 分钟一次」）。
+        runCatching { balanceFallback(accounts) }
+            .onFailure { LogBus.log("[balance] 兜底刷新异常：${it.message}") }
 
         // 凭证保活巡检：AT 剩余不足 30 分钟就提前续一次。这是「闲置一天后第一个请求先撞 401」
         // 的正解 —— 1.7.3 之前只在请求路径上临期续期，账号不请求就永远不会续，UI 上看到的
@@ -283,6 +276,32 @@ object Scheduler {
         if (ok > 0) Gateway.pool.reload()
         LogBus.log("[token] 全量保活：$ok 个账号已续期")
         return ok
+    }
+
+    /** 余额兜底刷新节流：60 分钟（请求后冷静期刷新是主路径，这里只兜长空窗）。 */
+    private val balanceFallbackMs = 60 * 60_000L
+    private var lastBalanceSweepMs = 0L
+
+    /**
+     * 余额兜底刷新（见 tick 里的调用点）。
+     *
+     * 判据是「有账号的 last_balance_at 超过 1 小时」而不是「到点就刷」：冷启动刷新 /
+     * 请求后冷静期刷新刚写过的号不会再被白刷一次。
+     */
+    private fun balanceFallback(accounts: List<AuthEntry>) {
+        if (!Gateway.store.config.schedule.balance_refresh_enabled) return
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastBalanceSweepMs < balanceFallbackMs) return
+        val now = nowMs / 1000
+        val stale = accounts.filter { a ->
+            val st = Gateway.store.stateOf(a.uid)
+            !st.disabled && now - st.last_balance_at >= 3600
+        }
+        // 全部新鲜（或全禁用）：不刷，但也要把节流打上，避免每分钟重复扫描。
+        lastBalanceSweepMs = nowMs
+        if (stale.isEmpty()) return
+        val r = runBlocking { com.wb.api.server.CreditsService.refresh(stale) }
+        LogBus.log("[balance] 兜底刷新 ${stale.size} 个账号：${com.wb.api.server.CreditsService.summary(r)}")
     }
 
     private fun runBulk(label: String, op: suspend (AuthEntry) -> Any?) {

@@ -1,12 +1,12 @@
 package com.wb.api
 
 import android.content.Context
-import com.wb.api.core.Durations
 import com.wb.api.core.GatewayConfig
 import com.wb.api.core.LogBus
 import com.wb.api.data.Store
 import com.wb.api.model.RequestMetrics
 import com.wb.api.pool.AccountPool
+import com.wb.api.server.CreditsService
 import com.wb.api.upstream.UpstreamClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -146,19 +146,12 @@ object Gateway {
         lifecycleScope.launch {
             val accounts = store.auths()
             if (accounts.isEmpty()) return@launch
-            val soonSec = Durations.parse(store.config.pool.expiring_soon, 168 * 3600L)
-            var ok = 0
-            for (a in accounts) {
-                runCatching { upstream.balanceDetailed(a, soonSec) }
-                    .onSuccess { b ->
-                        if (b.known) {
-                            pool.setCredits(a.uid, b.remain, b.earliestAt, b.earliestRemaining)
-                            ok++
-                        }
-                    }
-                    .onFailure { LogBus.log("[sys] 余额刷新($reason) ${a.uid.take(8)}: ${it.message}") }
+            // 统一走 CreditsService（余额 + 最早到期批次一起写回，失败逐号记日志）。
+            val r = runCatching { CreditsService.refresh(accounts) }.getOrElse {
+                LogBus.log("[sys] 余额刷新($reason) 异常：${it.message}")
+                return@launch
             }
-            if (ok > 0) LogBus.log("[sys] 余额刷新($reason)：$ok/${accounts.size} 个账号已同步")
+            if (r.ok > 0) LogBus.log("[sys] 余额刷新($reason)：${r.ok}/${accounts.size} 个账号已同步")
         }
     }
 

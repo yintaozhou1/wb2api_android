@@ -33,7 +33,8 @@ object PanelApi {
                 parts[0] == "checkin_all" -> bulk("checkin", res)
                 parts[0] == "balance_all" -> bulk("balance", res)
                 parts[0] == "activity_all" -> bulk("activity", res)
-                parts[0] == "travel_all" -> bulk("travel", res)
+                // 猫猫旅行：上游接口未公开，bulk() 的 op 白名单会直接回 501；
+                // 这里不再保留一条「接上就必然失败」的路由（UI 侧同样如实标注未实现）。
                 parts[0] == "keepalive_all" -> bulk("keepalive", res)
                 parts[0] == "accounts" && parts.size >= 3 -> accountOp(parts[1], parts.drop(2), req, res)
                 parts[0] == "tasks" && parts.size >= 2 && parts[1] == "scan_all" -> scanAll(res)
@@ -264,11 +265,14 @@ object PanelApi {
             "balance" -> {
                 val a = Gateway.store.getAuth(uid)
                 if (a == null) { res.sendError(404, "account not found"); return }
-                val soonSec = com.wb.api.core.Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
-                val b = runCatching { runBlocking { Gateway.upstream.balanceDetailed(a, soonSec) } }
-                    .getOrElse { com.wb.api.upstream.UpstreamClient.Balance(-1.0) }
-                if (b.known) Gateway.pool.setCredits(uid, b.remain, b.earliestAt, b.earliestRemaining)
-                res.sendJson(200, buildJsonObject { put("ok", JsonPrimitive(true)); put("credits", JsonPrimitive(b.remain)) })
+                // 统一走 CreditsService；成功与否**如实**回填（原实现失败也报 ok=true、credits=-1，
+                // 面板据此显示「刷新成功」但数字是 -1）。
+                val r = runCatching { runBlocking { com.wb.api.server.CreditsService.fetchIntoPool(a) } }
+                res.sendJson(200, buildJsonObject {
+                    put("ok", JsonPrimitive(r.isSuccess))
+                    put("credits", JsonPrimitive(r.getOrNull() ?: -1.0))
+                    r.exceptionOrNull()?.message?.let { put("message", JsonPrimitive(it)) }
+                })
             }
             "checkin" -> {
                 val a = Gateway.store.getAuth(uid)
@@ -366,10 +370,7 @@ object PanelApi {
                                 }
                             }
                             "balance" -> {
-                                val soonSec = com.wb.api.core.Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
-                                val b = Gateway.upstream.balanceDetailed(a, soonSec)
-                                if (!b.known) throw IllegalStateException("上游未返回余额数据")
-                                Gateway.pool.setCredits(a.uid, b.remain, b.earliestAt, b.earliestRemaining)
+                                com.wb.api.server.CreditsService.fetchIntoPool(a)
                                 "ok"
                             }
                             // 活动上报：**不能**发空 events 数组。上游 report 的硬性约束是
@@ -389,8 +390,10 @@ object PanelApi {
                                     Gateway.store.saveAuth(r.renewed)
                                     Gateway.pool.reload()
                                 }
-                                if (r.state == "dead") Gateway.pool.markSessionDead(a.uid)
-                                if (r.state == "dead") throw IllegalStateException(r.message)
+                                if (r.state == "dead") {
+                                    Gateway.pool.markSessionDead(a.uid)
+                                    throw IllegalStateException(r.message)
+                                }
                                 r.message
                             }
                             else -> throw IllegalStateException("unknown op: $op")

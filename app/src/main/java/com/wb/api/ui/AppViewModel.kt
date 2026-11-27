@@ -4,7 +4,6 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.wb.api.Gateway
-import com.wb.api.core.Durations
 import com.wb.api.core.GatewayConfig
 import com.wb.api.core.LogBus
 import com.wb.api.core.LogEntry
@@ -18,11 +17,13 @@ import com.wb.api.model.ModelInfo
 import com.wb.api.pool.AccountView
 import com.wb.api.pool.PoolCounts
 import com.wb.api.scheduler.Scheduler
+import com.wb.api.server.CreditsService
 import com.wb.api.server.GrowthService
 import com.wb.api.server.ModelService
 import com.wb.api.overlay.AddressOverlay
 import com.wb.api.service.GatewayService
 import com.wb.api.upstream.DeviceAuth
+import com.wb.api.upstream.Up
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -526,18 +527,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun balance(uid: String) = ioAsync("余额刷新") {
         val a = Gateway.store.getAuth(uid) ?: return@ioAsync "账号不存在"
-        val soonSec = Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
-        val r = runCatching { Gateway.upstream.balanceDetailed(a, soonSec) }
-        val b = r.getOrNull()
-        when {
-            r.isFailure -> "获取失败：${r.exceptionOrNull()?.message ?: "未知错误"}"
-            b == null || !b.known -> "上游未返回余额数据"
-            else -> {
-                // 带上最早到期批次：快过期额度才能被 prefer_expiring 优先消耗。
-                Gateway.pool.setCredits(uid, b.remain, b.earliestAt, b.earliestRemaining)
-                "余额 ${wbCreditsText(b.remain)}"
-            }
-        }
+        // 统一走 CreditsService：余额与「最早到期批次」必须一起写回，否则 prefer_expiring 失效。
+        runCatching { CreditsService.fetchIntoPool(a) }.fold(
+            onSuccess = { "余额 ${Up.creditsText(it)}" },
+            onFailure = { "获取失败：${it.message ?: "未知错误"}" },
+        )
     }
 
     /** 全量签到：无账号时明确拒绝，不再假装「完成 0/0 = 成功」。 */
@@ -595,30 +589,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (accounts.isEmpty()) {
                     "尚未添加账号"
                 } else {
-                    var ok = 0; var fail = 0
-                    var total = 0.0
-                    val soonSec = Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
-                    accounts.forEach { a ->
-                        runCatching { Gateway.upstream.balanceDetailed(a, soonSec) }
-                            .onSuccess { b ->
-                                if (b.known) {
-                                    Gateway.pool.setCredits(a.uid, b.remain, b.earliestAt, b.earliestRemaining)
-                                    ok++
-                                    total += b.remain
-                                } else {
-                                    fail++
-                                }
-                            }
-                            .onFailure {
-                                fail++
-                                LogBus.log("[task] 余额 ${a.nickname.ifBlank { a.uid.take(8) }}: ${it.message}")
-                            }
-                    }
-                    buildString {
-                        append("可用 ").append(wbCreditsText(total)).append(" 积分")
-                        append("（").append(ok).append(" 个账号）")
-                        if (fail > 0) append(" · 失败 ").append(fail).append(" 个")
-                    }
+                    // 统一走 CreditsService：单个失败只记日志，不中断整批。
+                    CreditsService.summary(CreditsService.refresh(accounts))
                 }
             }
             _refreshingBalance.value = false
@@ -928,14 +900,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         // 同步余额：**与 OAuth 登录路径逐行一致**（见 LoginWebActivity 的
                         // saveAuth → checkin → balanceDetailed 三步）。不刷的话，新导入的账号
                         // 在池里没有积分，账号栏会显示 0。失败仅记日志，不阻断导入。
-                        val soonSec = Durations.parse(Gateway.store.config.pool.expiring_soon, 168 * 3600L)
-                        runCatching { Gateway.upstream.balanceDetailed(entry, soonSec) }
-                            .onSuccess { b ->
-                                if (b.known) {
-                                    Gateway.pool.setCredits(entry.uid, b.remain, b.earliestAt, b.earliestRemaining)
-                                }
-                            }
-                            .onFailure { LogBus.log("[导入] 余额 uid=${entry.uid}: ${it.message}") }
+                        // 统一走 CreditsService（失败由它记日志，不阻断导入）。
+                        CreditsService.refreshOne(entry)
                         Gateway.pool.reload()
                     }.onFailure {
                         LogBus.log("[导入] 后置动作失败 uid=${entry.uid}: ${it.message}")

@@ -1671,20 +1671,42 @@ fun SettingsScreen(cfg: GatewayConfig, vm: AppViewModel, onAbout: () -> Unit) {
                     )
                     WbSwitchRow(
                         title = "余额自动刷新",
-                        summary = "定时同步账号剩余积分",
+                        summary = "对话结束后静默一段时间自动同步剩余积分；冷启动时也会刷新一次",
                         checked = draft.schedule.balance_refresh_enabled,
                         onCheckedChange = { draft = draft.copy(schedule = draft.schedule.copy(balance_refresh_enabled = it)) },
                     )
                     if (draft.schedule.balance_refresh_enabled) {
-                        WbSliderRow(
-                            title = "刷新间隔",
-                            summary = "定时同步账号剩余积分",
-                            value = draft.schedule.balance_refresh_minutes,
-                            range = 1..120,
-                            step = 1,
-                            unit = " 分钟",
-                            onChange = { draft = draft.copy(schedule = draft.schedule.copy(balance_refresh_minutes = it)) },
+                        // 1.7.5：定时刷新 → 「请求后冷静期」。选项固定为 5/15/30/60 秒，
+                        // 值域与 BalanceAutoRefresh 共用一处，避免 UI 与运行时各写一份。
+                        val choices = com.wb.api.scheduler.BalanceAutoRefresh.COOLDOWN_CHOICES
+                        // 与运行时共用同一条收敛规则：非法值（旧配置手改成 10）显示默认 15。
+                        val cooldown = com.wb.api.scheduler.BalanceAutoRefresh.normalizeCooldown(
+                            draft.schedule.balance_refresh_cooldown,
                         )
+                        Column(
+                            Modifier.padding(horizontal = WbD.rowPadH).padding(bottom = WbD.gapS),
+                            verticalArrangement = Arrangement.spacedBy(WbD.gapS),
+                        ) {
+                            Text(
+                                "请求后冷静期",
+                                style = MiuixTheme.textStyles.footnote1,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                            WbSegmented(
+                                choices.map { "$it 秒" },
+                                choices.indexOf(cooldown).coerceAtLeast(0),
+                            ) { idx ->
+                                draft = draft.copy(
+                                    schedule = draft.schedule.copy(balance_refresh_cooldown = choices[idx]),
+                                )
+                            }
+                            Text(
+                                "请求成功后若 ${cooldown} 秒内没有新请求，才刷新一次额度；" +
+                                    "期间继续请求则重新计时，不会重复刷新。",
+                                style = MiuixTheme.textStyles.footnote2,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
                     }
                 }
             }
