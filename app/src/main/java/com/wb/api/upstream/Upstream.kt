@@ -5,6 +5,7 @@ import com.wb.api.core.objOrNull
 import com.wb.api.core.primText
 import com.wb.api.core.primTextOrNull
 import com.wb.api.core.LogBus
+import com.wb.api.core.safeTake
 import com.wb.api.model.AuthEntry
 import com.wb.api.model.CredentialHealth
 import kotlinx.coroutines.Dispatchers
@@ -112,6 +113,14 @@ object Up {
      * `wbCreditsText()` 显示成「不限」。
      */
     const val ENTERPRISE_UNLIMITED_REMAIN: Double = 1099511627776.0
+
+    /**
+     * 额度文案（**单一来源**）：企业版「不限量」在池内用 [ENTERPRISE_UNLIMITED_REMAIN]
+     * （1<<40）表示，直接格式化会打印出 1099511627776 —— 统一显示成「不限」。
+     * 界面（`wbCreditsText`）与日志（`CreditsService.summary`）共用这一处，避免格式漂移。
+     */
+    fun creditsText(v: Double): String =
+        if (v >= ENTERPRISE_UNLIMITED_REMAIN) "不限" else "%.1f".format(v)
 
     /** 「快过期」默认窗口（与 `PoolCfg.expiring_soon` 默认的 168h 一致），调用方可覆盖。 */
     const val EXPIRING_SOON_DEFAULT_SEC: Long = 168 * 3600L
@@ -320,6 +329,21 @@ object Up {
     }
 }
 
+/** 401 的求证结果（见 [UpstreamClient.verifySession]）。 */
+enum class SessionVerdict {
+    /** refresh 成功：401 是边缘瞬时拦截，账号健康。 */
+    ALIVE,
+
+    /** refresh 被应用层明确拒绝：token 真失效，只能重新登录。 */
+    DEAD,
+
+    /** refresh 未给出判词（传输错误 / 5xx / 429 / HTML 拦截页 / 无 RT）：不下结论。 */
+    UNKNOWN,
+}
+
+/** [UpstreamClient.verifySession] 的返回值：判词 + refresh 成功时的新凭证。 */
+data class SessionProof(val verdict: SessionVerdict, val renewed: AuthEntry? = null)
+
 /**
  * chat 出站的会话头族参数（对齐新上游 `upstream.ChatMeta` + `injectConversationHeaders`）。
  *
@@ -337,21 +361,6 @@ object Up {
  * 消息级 ID（X-Conversation-Message-ID / X-Request-ID / B3 SpanId）每条出站独立生成，
  * 属于传输层细节，不放进这个数据类。
  */
-/** 401 的求证结果（见 [UpstreamClient.verifySession]）。 */
-enum class SessionVerdict {
-    /** refresh 成功：401 是边缘瞬时拦截，账号健康。 */
-    ALIVE,
-
-    /** refresh 被应用层明确拒绝：token 真失效，只能重新登录。 */
-    DEAD,
-
-    /** refresh 未给出判词（传输错误 / 5xx / 429 / HTML 拦截页 / 无 RT）：不下结论。 */
-    UNKNOWN,
-}
-
-/** [UpstreamClient.verifySession] 的返回值：判词 + refresh 成功时的新凭证。 */
-data class SessionProof(val verdict: SessionVerdict, val renewed: AuthEntry? = null)
-
 data class ConvIds(
     val clientConversationId: String = "",
     val sessionKey: String = "",
@@ -364,6 +373,17 @@ class UpstreamException(val kind: ErrKind, val status: Int, val body: String) : 
 enum class ErrKind {
     NONE, HARD_CREDIT, SOFT_RATE, SESSION_DEAD, NOT_FOUND, SERVER,
     CONTENT_BLOCKED, BAD_PARAMS, ACCOUNT_FAULT, MODEL_BLOCKED,
+    /**
+     * 11102 / 14401「该模型 id 在上游不存在」→ **请求级**错误。
+     *
+     * 上游 issue #280 真机实测：同一个 body 换遍整池都是同一句（display name 三个号 4.1s
+     * 全 11102，换成正确 id 立刻 200）—— 换号只是白打全池。处置：不罚号、不轮转、
+     * 不写负缓存，末端 400 透传原文。
+     *
+     * 与 [MODEL_BLOCKED]（11158「该账号类型无权使用该模型」）必须分开：后者换到有权限的
+     * 号**真的能成功**，属 (账号, 模型) 级负缓存 + 轮转。
+     */
+    MODEL_MISSING,
     WAF_BLOCK, PROMPT_TOO_LONG, IMAGE_INVALID, CLIENT,
 
     /**
@@ -639,7 +659,7 @@ class UpstreamClient(
         // 会退化成不可读形式，且绕过了 UpstreamException 的统一分类。这里收敛为可读异常
         // （与 core/Json.kt 里 primText/objOrNull 的安全扩展同一套口径）。
         val root = AppJson.parseToJsonElement(text).objOrNull()
-            ?: throw UpstreamException(ErrKind.CLIENT, 200, "上游返回非 JSON 对象响应：${text.take(120)}")
+            ?: throw UpstreamException(ErrKind.CLIENT, 200, "上游返回非 JSON 对象响应：${text.safeTake(120)}")
         val code = (root["code"]?.primTextOrNull() ?: "0").toDoubleOrNull() ?: 0.0
         if (code != 0.0) {
             val msg = root["msg"]?.primTextOrNull() ?: ""
@@ -1152,7 +1172,7 @@ class UpstreamClient(
             last = r
             if (r.code != 404) break
         }
-        throw UpstreamException(Classify.of(last.code, last.text), last.code, "HTTP ${last.code} @ ${last.url} :: ${last.text.take(160)}")
+        throw UpstreamException(Classify.of(last.code, last.text), last.code, "HTTP ${last.code} @ ${last.url} :: ${last.text.safeTake(160)}")
     }
 
     /**
@@ -1213,7 +1233,7 @@ class UpstreamClient(
         }
         throw UpstreamException(
             Classify.of(last.code, last.text), last.code,
-            "HTTP ${last.code} @ ${last.url} :: ${last.text.take(160)}",
+            "HTTP ${last.code} @ ${last.url} :: ${last.text.safeTake(160)}",
         )
     }
 
@@ -1324,7 +1344,7 @@ class UpstreamClient(
         if (isCheckinPending(last.text)) return@withContext "处理中"
         throw UpstreamException(
             Classify.of(last.code, last.text), last.code,
-            "HTTP ${last.code} @ ${last.url} :: ${last.text.take(160)}",
+            "HTTP ${last.code} @ ${last.url} :: ${last.text.safeTake(160)}",
         )
     }
 
@@ -1389,7 +1409,7 @@ class UpstreamClient(
             val realm = auth.realm
             val paths = Up.meterPaths(realm, Up.P_RESOURCE, Up.P_RESOURCE_ALT)
             val r = billingCall(realm, auth, "POST", paths, resourceBody())
-            if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.take(160)}")
+            if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.safeTake(160)}")
             val data = parseEnvelope(r.text)
 
             fun longOf(o: JsonObject, k: String): Long =
@@ -1454,7 +1474,7 @@ class UpstreamClient(
     private fun enterpriseUsage(auth: AuthEntry, soonSec: Long): Balance {
         val paths = Up.meterPaths(auth.realm, Up.P_ENTERPRISE_USAGE, Up.P_ENTERPRISE_USAGE_ALT)
         val r = billingCall(auth.realm, auth, "POST", paths, "{}")
-        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.take(160)}")
+        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.safeTake(160)}")
         val data = parseEnvelope(r.text)
         val limit = data.num("limitNum", "limit_num")?.toLong() ?: 0L
         val used = data.num("credit", "used_num") ?: 0.0
@@ -1488,7 +1508,7 @@ class UpstreamClient(
 
     suspend fun report(auth: AuthEntry, events: String): String = withContext(Dispatchers.IO) {
         val r = chatCall(auth.realm, auth, "POST", Up.P_REPORT, events)
-        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.take(160)}")
+        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "HTTP ${r.code} @ ${r.url} :: ${r.text.safeTake(160)}")
         r.text
     }
 
@@ -1793,7 +1813,7 @@ class UpstreamClient(
         }
         val body = buildJsonArray { add(ev) }.toString()
         val r = billingCall(auth.realm, auth, "POST", listOf(Up.P_REPORT), body)
-        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "report HTTP ${r.code} @ ${r.url} :: ${r.text.take(120)}")
+        if (!r.ok) throw UpstreamException(Classify.of(r.code, r.text), r.code, "report HTTP ${r.code} @ ${r.url} :: ${r.text.safeTake(120)}")
         "ok"
     }
 
@@ -2181,7 +2201,8 @@ private val JsonPrimitive.strOrNull: String?
  * 错误分类：**判定顺序逐条对齐 Go `internal/upstream/client.go:Classify`**。
  *
  * 顺序自「严」到「宽」，每层先后都有语义依据（Go 注释原文摘要）：
- *  0. 11102「该后端无此模型」最具体，最先判（只认 400/404；429+11102 属限流走第 4 层）；
+ *  0. 11102/14401「该模型 id 不存在」与 11158「账号类型无权限」最具体，最先判
+ *     （只认 400/404；429+11102 属限流走第 4 层）；前者请求级不轮转，后者换号；
  *  1. 402 真正的计费余额耗尽，最严、最不可自愈；
  *  2. session 终态（12153 等）需人工重登，精确 marker 优先于宽泛的限流层；
  *  3. 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）——
@@ -2215,16 +2236,90 @@ object Classify {
         // 不能因为 code 相同就被 isChannelBlock 当成渠道拦截，也不能落进 CLIENT 去降权。
         "security policy", "blocked by security",
     )
+    /**
+     * 11102/14401 答复的**确定性**文案（官方 error message 固定短语）。
+     * 只收这个窄短语，不收 "model ... not found" 宽正则 —— 后者会误伤其他业务的 not found 措辞。
+     */
+    private val modelMissingMarkers = listOf("service info not found", "route config not found")
+
+    /** 11158「该账号类型无权使用该模型」的文案（同一模型在不同账号类型上权限不同）。 */
+    private val modelForbiddenMarkers = listOf("is not allowed for user type")
+
+    /** 从错误信封里取 code / msg（兼容顶层与 error 子对象、字符串或数字 code）。 */
+    private fun codeAndMsg(body: String): Pair<String, String> {
+        val root = runCatching { AppJson.parseToJsonElement(body).objOrNull() }.getOrNull()
+            ?: return "" to ""
+        fun pick(node: JsonObject): Pair<String, String> {
+            val code = (node["code"] ?: node["errCode"] ?: node["error_code"])
+                ?.primTextOrNull()?.trim().orEmpty()
+            val msg = (node["msg"] ?: node["message"])
+                ?.primTextOrNull()?.trim().orEmpty()
+            return code to msg
+        }
+        var (c, m) = pick(root)
+        val inner = root["error"]?.objOrNull()
+        if (inner != null) {
+            val (c2, m2) = pick(inner)
+            if (c.isBlank()) c = c2
+            if (m.isBlank()) m = m2
+        }
+        return c to m
+    }
+
+    /**
+     * 11102 / 14401「这个模型 id 在上游不存在」判定（只认 400/404；429+11102 属限流语义）。
+     *
+     * 结构化优先：`code` 精确等于 11102/14401，或 `msg` 命中固定窄短语。绝不做整段文本
+     * 子串匹配 —— 错误体里的 requestId 是 32 位 hex，拿整段匹配会把 "11102" 撞在 ID 上。
+     */
+    fun isModelMissing(status: Int, body: String): Boolean {
+        if ((status != 400 && status != 404) || body.isEmpty()) return false
+        val lower = body.lowercase()
+        if (!lower.contains("11102") && !lower.contains("14401") &&
+            modelMissingMarkers.none { lower.contains(it) }
+        ) return false
+        val (code, msg) = codeAndMsg(body)
+        if (code == "11102" || code == "14401") return true
+        val m = msg.lowercase()
+        if (modelMissingMarkers.any { m.contains(it) }) return true
+        // body 不是 JSON（或又被序列化了一层 `\"code\":11102`）时，退回**结构化** codeMarker：
+        // 它要求 `"code":` 键，requestId 里的同一串数字不会误伤（裸子串会）。
+        val b = lower.replace("\\", "")
+        return codeMarker(b, "11102") || codeMarker(b, "14401")
+    }
+
+    /** 11158「该账号类型无权使用该模型」判定（与 11102 分开处置，见 [ErrKind.MODEL_MISSING]）。 */
+    fun isModelForbidden(status: Int, body: String): Boolean {
+        if ((status != 400 && status != 404) || body.isEmpty()) return false
+        val lower = body.lowercase()
+        if (!lower.contains("11158") && modelForbiddenMarkers.none { lower.contains(it) }) return false
+        val (code, msg) = codeAndMsg(body)
+        if (code == "11158") return true
+        val m = msg.lowercase()
+        if (modelForbiddenMarkers.any { m.contains(it) }) return true
+        return codeMarker(lower.replace("\\", ""), "11158")
+    }
+
     private val promptTooLongMarkers = listOf("11115", "prompt is too long", "context length")
     private val invalidImageMarkers = listOf("11133", "invalid image", "image format", "unsupported image", "图片格式")
     /** 请求体解析失败（HTTP 400 + `"code":11101` / "Unmarshal chat params failed"）→ 请求级确定性错误。 */
+    /**
+     * 请求级错误的**数值业务码**：一律用 [codeMarker] 结构化判定。
+     *
+     * 不能裸子串：requestId 是 32 位 hex，`11148` / `11103` 这类 5 位数字串有可能恰好
+     * 出现在里面；误判成 BAD_PARAMS 会直接 fail-fast（不再换号），等于让一条正常请求
+     * 因 id 里的一串数字而放弃整池。
+     *
+     * 11101 请求体解析失败 / 11103 该模型后端未启用 / 11129 tools schema 类型不合法 /
+     * 11148 工具结果与调用配对错位 / 11152 顶层 $ref —— 上游实测「同一份 body 换遍全池
+     * 都被同样拒绝」，轮转只会白打账号并制造连败降权。
+     */
+    private val badParamCodes = listOf("11101", "11103", "11129", "11148", "11152")
+
+    /** 非数值形态的同一族错误（上游把 11101 / 11129 的文案直接放进 msg 的形态）。 */
     private val badParamsMarkers = listOf(
-        "11101", "unmarshal chat params failed",
-        // 上游 2026-11 新登记的工具调用类请求级错误：换号也没用（同一份 tools/历史发给任何号
-        // 都会被同样拒绝），必须归「请求级零动作」，否则会被记成账号连败 → 连坐降权/禁用。
-        "11129", "invalid function call parameters",  // tools schema 关键字类型不合法（#251/#266）
-        "11148",                                       // 工具结果早于调用（历史配对错位，#253）
-        "11152",                                       // 顶层 $ref / schema 关键字类型（2026-11-18）
+        "unmarshal chat params failed",
+        "invalid function call parameters",  // tools schema 关键字类型不合法（#251/#266）
     )
 
     /**
@@ -2333,8 +2428,13 @@ object Classify {
     fun of(status: Int, body: String): ErrKind {
         val b = body.lowercase()
         return when {
-            // 0. 11102「该后端无此模型」
-            (status == 400 || status == 404) && b.contains("11102") -> ErrKind.MODEL_BLOCKED
+            // 0. 11102/14401「该模型 id 在上游不存在」→ **请求级**（上游 issue #280：
+            //    换遍全池都是同一句，换号只是白打全池）。不罚号、不轮转、不写负缓存。
+            isModelMissing(status, body) -> ErrKind.MODEL_MISSING
+            // 0.1 11158「该账号类型无权使用该模型」→ (账号,模型) 负缓存 + 换号：
+            //     同一模型在不同账号类型上权限不同，换到有权限的号真的能成功（实测
+            //     global:gpt-6-luna → 11158 not allowed for user type [personal_free_user]）。
+            (status == 400 || status == 404) && isModelForbidden(status, body) -> ErrKind.MODEL_BLOCKED
             // 0.5 渠道校验拦截（11-128 / 11128 "request illegal"）
             //
             // 必须排在 accountFaultMarkers 之前：后者的 "request illegal" 判据会把这一类
@@ -2376,6 +2476,9 @@ object Classify {
             // 原实现把**所有** 4xx 都归 BAD_PARAMS，而 failFastKinds 含 BAD_PARAMS，于是任何
             // 未知 4xx（401/403 带信封、405、非特定文案的 400…）都会 fail-fast 直接放弃池里
             // 其它账号 —— 与 failFastKinds 的注释、README 1.6.1 的「CLIENT 继续轮转」自述矛盾。
+            // 请求级业务码（11101/11103/11129/11148/11152）：只认结构化 code，
+            // requestId 里恰好含同一串数字不会误判（见 [badParamCodes]）。
+            badParamCodes.any { codeMarker(b.replace("\\", ""), it) } -> ErrKind.BAD_PARAMS
             badParamsMarkers.any { b.contains(it) } -> ErrKind.BAD_PARAMS
             status >= 400 -> ErrKind.CLIENT
             else -> ErrKind.NONE

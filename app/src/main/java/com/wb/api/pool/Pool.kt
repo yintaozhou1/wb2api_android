@@ -3,6 +3,7 @@ package com.wb.api.pool
 import com.wb.api.core.Durations
 import com.wb.api.core.GatewayConfig
 import com.wb.api.core.LogBus
+import com.wb.api.core.safeTake
 import com.wb.api.data.Store
 import com.wb.api.model.AccountState
 import com.wb.api.model.AuthEntry
@@ -268,6 +269,40 @@ class AccountPool(
     }
 
     /**
+     * 选号失败的成因拆解（对齐上游 `pool/nopick.go`，issue #276）。
+     *
+     * `no_healthy_account` 是一句笼统的「没有可用账号」：池里明明有 15 个有余额的号时，
+     * 用户只能看到这句话，而真实原因可能是禁用 / 暂停选号 / 凭证失效 / 账号冷却 / 在途占满 /
+     * 该模型冷却 / 本轮已试过 —— 五种处置完全不同（充值 / 调阈值 / 提并发 / 等冷却 / 换号）。
+     *
+     * 判据顺序**必须与 [pick] 一致**，否则「选不到」与「归到哪一类」会自相矛盾。
+     */
+    fun pickBreakdown(realm: String, model: String, tried: Set<String>): String {
+        val t = now()
+        val max = realmMaxInFlight(realm)
+        var total = 0; var ok = 0; var triedN = 0; var disabled = 0; var paused = 0
+        var dead = 0; var coolingN = 0; var full = 0; var modelBlocked = 0
+        store.auths().forEach { a ->
+            if (a.realm != realm) return@forEach
+            total++
+            val s = store.stateOf(a.uid)
+            when {
+                a.uid in tried -> triedN++
+                s.disabled -> disabled++
+                s.paused -> paused++
+                credentialDead(a) -> dead++
+                cooling(s) -> coolingN++
+                inFlightOf(a.uid) >= max -> full++
+                s.rate_limited_models.any { it.model == model && it.until > t } -> modelBlocked++
+                else -> ok++
+            }
+        }
+        return "total=$total healthy=$ok tried=$triedN disabled=$disabled paused=$paused " +
+            "dead=$dead cooling=$coolingN in_flight_full=$full model_blocked=$modelBlocked" +
+            (if (wafActive(realm)) " waf=1" else "")
+    }
+
+    /**
      * 占一个在途名额。
      *
      * 原实现 `return incrementAndGet() > 0` 恒为 true（增量后必然 > 0），且唯一调用点
@@ -399,7 +434,7 @@ class AccountPool(
         val p = cfg()
         val t = now()
         // 台账原因取上游原文（截断）：模型级阻塞报错时要能把「为什么不能用」原样带给客户端。
-        val why = body.take(200).replace('\n', ' ').trim()
+        val why = body.safeTake(200).replace('\n', ' ').trim()
         var ns = s.copy(err_total = s.err_total + 1, last_used_at = t)
         val cap = Durations.parse(p.cooldown.soft_rate_max, 7200)
         when (kind) {
@@ -447,14 +482,18 @@ class AccountPool(
                 }
             }
             ErrKind.MODEL_BLOCKED -> {
-                // 11102「该后端无此模型」：(账号,模型) 负缓存，TTL 6h 起按命中次数翻倍、封顶 24h。
+                // 11158「该账号类型无权使用该模型」：(账号,模型) 负缓存 + 换号。
+                //
+                // 11102「该模型 id 在上游不存在」1.7.5 起改判**请求级**（ErrKind.MODEL_MISSING，
+                // 不写台账、不轮转）：上游实测同一 body 换遍整池都是同一句，负缓存反而把
+                // 「换个 id 就能用」拖成 2~10 分钟不可用。这里只剩「换号真能成功」的 11158。
                 // 该模型请求成功即由 clearModelBlock 清除（对齐 Go BlockModelBackoff/Clear）。
                 val prev = s.rate_limited_models.firstOrNull { it.model == model && it.kind == "model_unavailable" }
                 val hits = (prev?.hits ?: 0) + 1
-                // TTL 从 6h/24h 缩到 **2m/10m**（上游 10-27）：11102 不总是「这号真没这模型」，
-                // 路径级问题、上游瞬时抖动、分类误判都会触发它。原参数把一次偶发误判放大成
-                // (账号,模型) 锁死 6 小时，多号轮一圈就是整池该模型不可用；实测同号两分钟就
-                // 能恢复。退避仍保留：真没模型的号会升到封顶 10 分钟，不会退化成每请求重试。
+                // TTL **2m 起、封顶 10m**（上游 10-27 口径）：账号类型权限本身是稳定属性，
+                // 但路径级问题、上游瞬时抖动、分类误判也会落到这一类；长锁会把一次误判放大成
+                // (账号,模型) 锁死数小时，多号轮一圈就是整池该模型不可用。退避保留：真的没权限
+                // 的号会升到封顶 10 分钟，不会退化成每请求重试。
                 val ttl = minOf(2L * 60 * (1L shl (hits - 1).coerceIn(0, 4)), 10L * 60)
                 ns = ns.copy(rate_limited_models = s.rate_limited_models.filter { it.model != model } +
                     ModelLimit(model, "model_unavailable", reset_at = 0, until = t + ttl, hits = hits, reason = why))
@@ -585,7 +624,8 @@ class AccountPool(
             else -> {
                 // 其余全部零动作，与上游一致：
                 //   NONE 防御路径 / CONTENT_BLOCKED 内容误报 / BAD_PARAMS 请求体畸形 /
-                //   PROMPT_TOO_LONG 11115 / IMAGE_INVALID 图片无效 —— 都是「请求的问题不是
+                //   PROMPT_TOO_LONG 11115 / IMAGE_INVALID 图片无效 / MODEL_MISSING 11102
+                //   模型 id 不存在（1.7.5，请求级：换号同样被拒）—— 都是「请求的问题不是
                 //   账号的问题」，同一 body 换任何号结果相同，罚号只会误伤健康账号。
             }
         }

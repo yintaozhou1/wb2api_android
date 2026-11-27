@@ -103,7 +103,8 @@ object Rewrite {
         @Suppress("UNCHECKED_CAST")
         val msgs0 = obj["messages"] as? MutableList<Any?>
         if (msgs0 != null) {
-            val repacked = repackToolResultBlocks(msgs0)
+            val merged = mergeAdjacentToolCalls(msgs0)
+            val repacked = repackToolResultBlocks(merged)
             val cleaned = cleanupOrphanToolCalls(repacked)
             obj["messages"] = cleaned
         }
@@ -346,13 +347,38 @@ object Rewrite {
         }
     }
 
+    /**
+     * JS 正则里的 `\uXXXX` / `\u{XXXX}` 转义（RE2 只有 `\x{...}`，没有 `\u`）。
+     * 对齐上游 `payload.go:re2Pattern`。
+     */
+    private val reUEscape = Regex("""\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})""")
+
+    /**
+     * 把 JS 正则里 RE2 不认的 `\u` 转义译成 `\x{...}`，并本地验证能编译（Java Pattern
+     * 从 7 起支持 `\x{h...h}`，已实测 `^[^\x{D800}-\x{DFFF}]*$` 可编译）。
+     *
+     * 不含 `\u` 时原样返回（正常 pattern 零额外开销）；译后仍编不过返回 null，由调用方
+     * **丢掉这个 pattern**：丢它只是放宽一条本地正则，留着等于让整包 tools 被上游否掉（11129）。
+     */
+    private fun re2Pattern(p: String): String? {
+        if (!p.contains("\\u")) return p
+        val q = reUEscape.replace(p) { m ->
+            val hex = m.groupValues[1].ifBlank { m.groupValues[2] }
+            "\\x{$hex}"
+        }
+        return runCatching { java.util.regex.Pattern.compile(q); q }.getOrNull()
+    }
+
     private fun unescapePatternLiteralEscapes(node: Any?) {
         when (node) {
             is MutableMap<*, *> -> {
                 @Suppress("UNCHECKED_CAST")
                 val m = node as MutableMap<String, Any?>
                 val p = m["pattern"]
-                if (p is String && p.contains("\\_")) m["pattern"] = p.replace("\\_", "_")
+                if (p is String) {
+                    val fixed = re2Pattern(if (p.contains("\\_")) p.replace("\\_", "_") else p)
+                    if (fixed == null) m.remove("pattern") else if (fixed != p) m["pattern"] = fixed
+                }
                 val props = m["patternProperties"]
                 if (props is MutableMap<*, *>) {
                     @Suppress("UNCHECKED_CAST")
@@ -442,6 +468,55 @@ object Rewrite {
         obj["messages"] = out
     }
 
+    /**
+     * 合并「相邻两批 tool_calls」：前一条 assistant 带 tool_calls、紧随其后的 assistant 也带
+     * tool_calls（中间没有 tool 结果）—— 在 wire 上它们是**同一轮**，拆开会让前一批调用变成
+     * 「无结果调用」，上游判 11148。
+     *
+     * 真实成因（上游 hub #26）：Responses 回放里 call / output 交错出现时，正文消息会把前一批
+     * 调用提前 flush 成独立一条，后续调用落进正文那条，出站就是相邻两批。
+     *
+     * 只合并「字符串或缺省」正文：content 是结构化 parts 时形状未知，宁可漏修也不改形状；
+     * 前一条没有 tool_calls 的相邻 assistant 是两轮真实对话，不合并。
+     */
+    private fun mergeAdjacentToolCalls(messages: MutableList<Any?>): MutableList<Any?> {
+        if (messages.size < 2) return messages
+        val out = ArrayList<Any?>(messages.size)
+        var changed = false
+        for (raw in messages) {
+            @Suppress("UNCHECKED_CAST")
+            val m = raw as? MutableMap<String, Any?>
+            if (m == null || m["role"] != "assistant" || out.isEmpty()) {
+                out.add(raw); continue
+            }
+            @Suppress("UNCHECKED_CAST")
+            val prev = out[out.size - 1] as? MutableMap<String, Any?>
+            val ptc = prev?.get("tool_calls") as? List<*>
+            val tc = m["tool_calls"] as? List<*>
+            if (prev == null || ptc.isNullOrEmpty()) {
+                out.add(raw); continue
+            }
+            val pContent = prev["content"]
+            val cContent = m["content"]
+            if ((pContent != null && pContent !is String) || (cContent != null && cContent !is String)) {
+                out.add(raw); continue
+            }
+            val pc = pContent as? String ?: ""
+            val cc = cContent as? String ?: ""
+            val merged = LinkedHashMap<String, Any?>(prev)
+            if (pc.isNotEmpty() || cc.isNotEmpty()) merged["content"] = pc + cc else merged.remove("content")
+            merged["tool_calls"] = ArrayList<Any?>(ptc) + (tc ?: emptyList<Any?>())
+            val rcs = ArrayList<String>()
+            (prev["reasoning_content"] as? String)?.takeIf { it.isNotEmpty() }?.let { rcs += it }
+            (m["reasoning_content"] as? String)?.takeIf { it.isNotEmpty() }?.let { rcs += it }
+            if (rcs.isNotEmpty()) merged["reasoning_content"] = rcs.joinToString("\n")
+            else merged.remove("reasoning_content")
+            out[out.size - 1] = merged
+            changed = true
+        }
+        return if (!changed) messages else out
+    }
+
     private fun repackToolResultBlocks(messages: MutableList<Any?>): MutableList<Any?> {
         if (messages.size < 3) return messages
         val out = ArrayList<Any?>(messages.size)
@@ -468,7 +543,13 @@ object Rewrite {
                 val role = mm["role"] as? String
                 if (role == "tool") {
                     val id = mm["tool_call_id"] as? String
-                    if (id == null || !want.contains(id)) break
+                    if (id == null || !want.contains(id)) {
+                        // 孤儿结果（对不上本批任何调用）：暂存待后移，**不能 break** —— 它后面
+                        // 可能还有本批的合法结果，break 会让那些结果永久停在原位、中间夹着插入物，
+                        // 照样 11148。孤儿本身由 cleanupOrphanToolCalls 整条删掉。
+                        between.add(messages[i]); sawNonTool = true; i++
+                        continue
+                    }
                     results.add(messages[i])
                     if (sawNonTool) changed = true
                     i++
@@ -531,13 +612,15 @@ object Rewrite {
             changed = true
             if (kept.isEmpty()) msg.remove("tool_calls") else msg["tool_calls"] = kept
         }
-        // 2) role:tool 结果：孤儿整条删除
+        // 2) role:tool 结果：孤儿整条删除；同一 call_id 的**重复结果只留第一条**
+        //    （上游一个调用只认一条结果，多出来的判 11148 —— 上游 tool_pairing 三修之一）。
         val keptMsgs = ArrayList<Any?>(messages.size)
+        val seenResult = HashSet<String>()
         for (m in messages) {
             val msg = m as? Map<*, *>
             if (msg != null && msg["role"] == "tool") {
                 val id = msg["tool_call_id"] as? String
-                if (id == null || !keepCalls.contains(id)) { changed = true; continue }
+                if (id == null || !keepCalls.contains(id) || !seenResult.add(id)) { changed = true; continue }
             }
             keptMsgs.add(m)
         }

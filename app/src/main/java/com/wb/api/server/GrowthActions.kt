@@ -1,6 +1,7 @@
 package com.wb.api.server
 
 import com.wb.api.Gateway
+import com.wb.api.core.safeTake
 import com.wb.api.model.AuthEntry
 import com.wb.api.upstream.desktopAutomationCreateEvent
 import com.wb.api.upstream.desktopBuddyAppSequence
@@ -91,7 +92,7 @@ object GrowthActions {
         val (ok, body) = Gateway.upstream.buddyFirst(a)
         if (ok) return "已领取 Buddy（+300 分 +8 能量）"
         if (body.contains("first_buddy task not completed yet")) return "前置已上报，但领养门槛未过，请稍后重试"
-        return "领取 Buddy 未成功：${body.take(80)}"
+        return "领取 Buddy 未成功：${body.safeTake(80)}"
     }
 
     /** 桌面端对话事件链（对齐 runRichMeow，autotask.go:835-845）。 */

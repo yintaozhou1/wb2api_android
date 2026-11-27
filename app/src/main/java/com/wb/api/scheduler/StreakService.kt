@@ -2,6 +2,7 @@ package com.wb.api.scheduler
 
 import com.wb.api.Gateway
 import com.wb.api.core.LogBus
+import com.wb.api.core.safeTake
 import com.wb.api.core.objOrNull
 import com.wb.api.core.primTextOrNull
 import com.wb.api.model.AuthEntry
@@ -81,7 +82,7 @@ object StreakService {
         if (chances <= 0) return true
         for (i in 0 until chances) {
             val prize = Gateway.upstream.lotteryDraw(a) ?: break
-            LogBus.log("streak-bonus $tag: 🎲 第${i + 1}抽 ${prize.take(220)}")
+            LogBus.log("streak-bonus $tag: 🎲 第${i + 1}抽 ${prize.safeTake(220)}")
         }
         LogBus.log("streak-bonus $tag: 抽奖完成 $chances 次")
         return true
