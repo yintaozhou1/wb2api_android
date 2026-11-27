@@ -8,8 +8,10 @@ import com.wb.api.core.primText
 import com.wb.api.core.primTextOrNull
 import com.wb.api.core.Ids
 import com.wb.api.core.LogBus
+import com.wb.api.core.safeTake
 import com.wb.api.model.AuthEntry
 import com.wb.api.model.UsageRecord
+import com.wb.api.scheduler.BalanceAutoRefresh
 import com.wb.api.upstream.CredentialService
 import com.wb.api.upstream.Classify
 import com.wb.api.upstream.ConvIds
@@ -58,6 +60,9 @@ object ChatHandler {
     private val failFastKinds = setOf(
         ErrKind.BAD_PARAMS, ErrKind.CONTENT_BLOCKED,
         ErrKind.PROMPT_TOO_LONG, ErrKind.IMAGE_INVALID,
+        // 11102/14401「该模型 id 不存在」：同一 body 换任何号都是同一句（上游 issue #280
+        // 实测三个号 4.1s 全 11102，换个 id 立刻 200）→ fail-fast 400 透传原文。
+        ErrKind.MODEL_MISSING,
         // 注意：6020/6021（ErrKind.UPSTREAM_BUSY）**不在这里**。上游 10-29（PR #108）做了
         // 语义修正：实测同一模型同一分钟内既有 6021 也有成功（两个号连续 6021 后 33 秒就通），
         // 说明**换号有意义**；因此恢复请求内轮转，终态改回 429 + Retry-After（见 mapError）。
@@ -217,6 +222,10 @@ object ChatHandler {
         // 选号返回 null 的两种成因要分开报：这里记下「是否因选不到号而终止」，
         // 供 mapError 判定是不是「号都在、只是都对这个模型冷却」（上游 issue #102）。
         var selectionFailed = false
+        // 选号失败的成因拆解（对齐上游 pool/nopick.go，issue #276）：no_healthy_account
+        // 太笼统 —— 池里 15 个有余额的号时，真实原因可能是禁用/暂停/死号/冷却/在途占满/
+        // 模型冷却/本轮已试过，处置完全不同。失败时填，随 503 的 hint 与日志一起给出。
+        var noPick = ""
         // 「模型繁忙」只等一次的额度（上游 issue #46）：不占换号次数、等待期间不占在途名额。
         var busyWaited = false
         // 「号都在途占满」只等一次的额度（上游 issue #117）：与上面同一套「不占换号次数」的语义。
@@ -252,6 +261,8 @@ object ChatHandler {
                         }
                         if (!Gateway.pool.slotWaitForModel(model, realm)) continue
                     }
+                    noPick = Gateway.pool.pickBreakdown(realm, model, tried)
+                    LogBus.log("$realm|$model 无可用账号：$noPick")
                     selectionFailed = true
                     break
                 }
@@ -379,7 +390,7 @@ object ChatHandler {
                         // 这类分支保住会话粘性 —— 否则客户端 40s 后重试会换号，前缀缓存全量 miss，
                         // 与上一段注释的初衷自相矛盾。
                         Gateway.pool.stickyUnbind(sessionKey ?: reqId)
-                        LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.take(200).replace('\n', ' ')}")
+                        LogBus.log("$realm|$model rotate uid=${auth.uid.take(8)} kind=$kind status=${resp.code} body=${text.safeTake(200).replace('\n', ' ')}")
                     }
                 } finally {
                     Gateway.pool.release(auth.uid)
@@ -388,7 +399,7 @@ object ChatHandler {
                 if (attempt < MAX_ROTATE) Thread.sleep(backoff(attempt))
             }
             httpOk = false
-            mapError(res, lastKind, lastBody, model, selectionFailed, realm)
+            mapError(res, lastKind, lastBody, model, selectionFailed, realm, noPick)
         } finally {
             val dur = System.currentTimeMillis() - start
             // 第二参 httpOk：HTTP 层面是否把一次成功响应交给了客户端 —— 正常完成（hop.ok）
@@ -407,6 +418,10 @@ object ChatHandler {
                     latency_ms = dur,
                     error = false,
                 ))
+                // 余额「请求后冷静期」：成功请求结束后开始倒计时，静默满冷静期才刷新一次
+                // 额度（期间继续请求则重新计时）。只记成功请求 —— 失败不改余额。
+                // 非关键路径不该有能力打断请求收尾（下面还有归档写盘）：包一层。
+                runCatching { BalanceAutoRefresh.noteRequest(servedUid) }
             }
             // 归档时间用**设备本地时区**的 ISO-8601（带 UTC 偏移，例：中国 UTC+8 → 2026-10-06T16:06:14.123+08:00）。
             // 需求：时间随「当前设备时区」表达（中国即 UTC+8），而不是恒为 UTC 的 …Z 形式或 Unix 时间戳。
@@ -910,8 +925,8 @@ object ChatHandler {
         if (ef != null) {
             val kind = Classify.frame(ef)
             noteError(auth, kind, 200, model, ef)
-            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
-            return Hop(ok = false, sent = true)
+            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} 上游 error 帧 kind=$kind payload=${ef.safeTake(200).replace('\n', ' ')}")
+            return Hop(ok = false, sent = true, errKind = kind, errBody = ef)
         }
         Gateway.pool.onSuccess(auth.uid, usage.completion, dur, 0.0, model, usage.prompt, usage.cached, ttfbMs)
         // 原来这条日志把**端到端耗时**写成 `ttfb=`（名不符实），一并修正：两者都打出来。
@@ -962,13 +977,13 @@ object ChatHandler {
         val reader = BufferedReader(InputStreamReader(bodyStreamOf(resp)))
         try {
             while (true) {
-                    // 读失败不能冒泡：responses 路径在读到首帧前就已 beginStream，异常逸出会被
-                    // runPipeline 当成「首帧前失败」换号重发——同一轮对话打两次上游（真实计费），
-                    // 第二次的事件还写进同一条已开流。这里按「断流」处理，走下方 incomplete 收尾。
+                    // 读失败不能冒泡：这条路径**尚未**向客户端写过任何字节，但异常逸出会被
+                    // runPipeline 当成 responder 异常记到账号头上（连败降权）。这里按「断流」
+                    // 处理 —— 下方「既无 finish_reason 也无 [DONE]」会如实标成 length。
                     val line = try {
                         reader.readLine()
                     } catch (e: Throwable) {
-                        LogBus.log("| # $realm/$model responses 上游流中断: ${e.message}")
+                        LogBus.log("| # $realm/$model 上游流中断（chat 非流式）: ${e.message}")
                         null
                     } ?: break
                 if (!line.startsWith("data:")) continue
@@ -1006,14 +1021,14 @@ object ChatHandler {
             val ef = errFrame
             val kind = Classify.frame(ef)
             noteError(auth, kind, 200, model, ef)
-            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} nonstream 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
+            LogBus.log("| # $realm/$model uid=${auth.uid.take(8)} nonstream 上游 error 帧 kind=$kind payload=${ef.safeTake(200).replace('\n', ' ')}")
             // 非流式路径拿到的上游 error 帧：这里不是「选号失败」，所以只按 kind 分类
             // （selectionFailed = false 表示不要去做「全池模型级阻塞」判定）。
             // 错误体**已经写回客户端** → 这里必须标记 sent=true：否则 runPipeline 会把它
             // 当成「首帧前失败」而换号重发，但 Res 已发出字节（sendBytes 里 `if (sent) return`），
             // 后续写入成为 no-op —— 最终「客户端拿到错误、网关却记为成功」并白白多打一次上游。
             mapError(res, kind, ef, model, false, realm)
-            return Hop(ok = false, sent = true)
+            return Hop(ok = false, sent = true, errKind = kind, errBody = ef)
         }
 
         // 正文里的 <think:SUF> 拆回 thinking（issue #194）：这类标签是上游把思考串漏进
@@ -1283,6 +1298,7 @@ object ChatHandler {
         model: String,
         selectionFailed: Boolean,
         realm: String = "",
+        noPick: String = "",
     ) {
         var msg = body.ifBlank {
             when (kind) {
@@ -1293,6 +1309,7 @@ object ChatHandler {
                 ErrKind.CHANNEL_BLOCK -> "channel verification failed: upstream rejected the " +
                     "request as non-official-client traffic (HTTP 400 code=11-128/11128 request illegal)"
                 ErrKind.UPSTREAM_BUSY -> "upstream queue is full, please retry in a few seconds"
+                ErrKind.MODEL_MISSING -> "upstream does not have this model id (400 code 11102); pick another model"
                 else -> "all accounts are temporarily unavailable, please retry later"
             }
         }
@@ -1308,10 +1325,10 @@ object ChatHandler {
             // 渠道校验：这是**请求指纹**问题（首条 system / 会话头族 / UA），不是账号耗尽。
             // 停在默认的 503 no_healthy_account 会误导用户去查账号池（实测就发生过）。
             ErrKind.CHANNEL_BLOCK -> 502 to "channel_verification_failed"
-            // 11102「该后端无此模型」：用 400 + 明确 code 讲清「不可重试，换个模型」。
+            // 11102/11158「这个模型用不了」：用 400 + 明确 code 讲清「不可重试，换个模型」。
             // 停在默认的 no_healthy_account 是「服务端过载」的语义，客户端会一直重试
             // （对齐上游 handler 的 ErrModelBlocked 分支与 issue #81）。
-            ErrKind.MODEL_BLOCKED -> 400 to "model_unavailable"
+            ErrKind.MODEL_BLOCKED, ErrKind.MODEL_MISSING -> 400 to "model_unavailable"
             // 14003 模型繁忙：503 + Retry-After（上游客户端契约）。与 11102 的区别是
             // 「等一会儿再来」而不是「换模型」—— 语义错了客户端会做错决策。
             ErrKind.MODEL_BUSY -> 503 to "model_busy"
@@ -1328,7 +1345,8 @@ object ChatHandler {
         var finalNumCode: Int? = null
         var hint = when {
             errCode == "no_healthy_account" ->
-                "no healthy account available in pool; check /status or retry later"
+                "no healthy account available in pool; check /status or retry later" +
+                    (if (noPick.isNotBlank()) " · pick{$noPick}" else "")
             errCode == "channel_verification_failed" ->
                 "upstream channel check rejected this request shape (HTTP 400 code=11-128/11128 " +
                     "\"request illegal\", displayTips: 这次调用没通过渠道校验). The account was " +
@@ -1391,9 +1409,10 @@ object ChatHandler {
         val retryAfter = when (finalErrCode) {
             "model_busy", "rate_limit_exceeded" -> {
                 val block = Gateway.pool.modelBlocked(model, realm)
-                if (block.until > 0) {
-                    (block.until - System.currentTimeMillis() / 1000).coerceIn(1, 60)
-                } else 0L
+                // 只到「解封时刻还没到」才发：已过期（until <= now）说明台账陈旧，硬给
+                // 1 秒会让客户端立刻重撞一次，正是上面注释要避免的那颗「1 秒」。
+                val nowSec = System.currentTimeMillis() / 1000
+                if (block.until > nowSec) (block.until - nowSec).coerceIn(1, 60) else 0L
             }
             // 6020/6021 排队：优先用上游给的口径（body 的 data.retry_after，6020 实测 40s），
             // 拿不到按 5s 兜底；封顶 600s —— 客户端把这个头当「睡多久」的指令且不设上限，
@@ -1908,22 +1927,36 @@ object ChatHandler {
             val reader = BufferedReader(InputStreamReader(bodyStreamOf(resp)))
             try {
                 while (true) {
-                    val line = reader.readLine() ?: break
+                    // 读失败不能冒泡：此时还没有向客户端写过任何字节，但异常逸出会被
+                    // runPipeline 当成 responder 异常记到账号头上。按「断流」处理（下方
+                    // !sawDone 会标 incomplete），错误分类留给真正的上游失败。
+                    val line = try {
+                        reader.readLine()
+                    } catch (e: Throwable) {
+                        LogBus.log("| # $realm/$model responses 上游流中断（非流式）: ${e.message}")
+                        null
+                    } ?: break
                     if (!line.startsWith("data:")) continue
                     val payload = line.substring(5).trim()
                     if (payload == "[DONE]") { sawDone = true; break }
-                    val el = runCatching { AppJson.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
-                    // 内嵌失败帧：与 chat 非流式同一口径（见 [embeddedErrorPayload]）。
-                    embeddedErrorPayload(el)?.let { errFrame = it; break }
-                    if (el.containsKey("error")) { errFrame = payload; break }
-                    usage = usage.merge(el)
-                    (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()?.let { ch ->
-                        ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let { finish = it }
-                        val d = ch["delta"]?.objOrNull()
-                        d?.get("content")?.primText()?.let { content.append(it) }
-                        d?.get("reasoning_content")?.primText()?.let { reasoning.append(it) }
-                        collectToolCalls(d, toolCalls)
+                    // 一行多 JSON（issue #197）：整行能解析就用整行，否则按顶层值边界拆开
+                    // 逐个并入。非流式同样要拆 —— 否则半条事件的 usage / tool_calls 会静默丢失。
+                    val frames = SseSplit.splitFrames(payload)
+                    var stop = false
+                    for ((p, el) in frames) {
+                        // 内嵌失败帧：与 chat 非流式同一口径（见 [embeddedErrorPayload]）。
+                        embeddedErrorPayload(el)?.let { errFrame = it; stop = true; break }
+                        if (el.containsKey("error")) { errFrame = p; stop = true; break }
+                        usage = usage.merge(el)
+                        (el["choices"] as? JsonArray)?.firstOrNull()?.objOrNull()?.let { ch ->
+                            ch["finish_reason"]?.primText()?.takeIf { it.isNotBlank() && it != "null" }?.let { finish = it }
+                            val d = ch["delta"]?.objOrNull()
+                            d?.get("content")?.primText()?.let { content.append(it) }
+                            d?.get("reasoning_content")?.primText()?.let { reasoning.append(it) }
+                            collectToolCalls(d, toolCalls)
+                        }
                     }
+                    if (stop) break
                 }
             } finally { runCatching { reader.close() } }
 
@@ -1931,10 +1964,14 @@ object ChatHandler {
                 val ef = errFrame
                 val kind = Classify.frame(ef)
                 noteError(uid, kind, 200, model, ef)
-                LogBus.log("| # $realm/$model responses 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
-                // 同上：错误体已回写 → sent=true，避免被 runPipeline 当成「未发数据」而重试。
-                res.sendError(mapCode(kind), ef, "upstream_error")
-                return Hop(ok = false, sent = true)
+                LogBus.log("| # $realm/$model responses 上游 error 帧 kind=$kind payload=${ef.safeTake(200).replace('\n', ' ')}")
+                // 走与 chat 完全相同的错误映射：**不能**用简化的 mapCode —— 那会把
+                // 6020/6021 排队（该回 429 + Retry-After 让客户端排队）与渠道校验拦截
+                // （该回 502 + 说明）都压成不可重试的 503，同一次上游失败在两个端点得到
+                // 两种语义，客户端据此做的重试决策就会错一半。
+                // 错误体已回写 → sent=true，避免被 runPipeline 当成「未发数据」而重试。
+                mapError(res, kind, ef, model, false, realm)
+                return Hop(ok = false, sent = true, errKind = kind, errBody = ef)
             }
 
             val pt = if (usage.prompt > 0) usage.prompt else (String(req.body).length / 4).toLong()
@@ -2195,12 +2232,12 @@ object ChatHandler {
                 val ef = errFrame
                 val kind = Classify.frame(ef)
                 noteError(uid, kind, 200, model, ef)
-                LogBus.log("| # $realm/$model responses 上游 error 帧 kind=$kind payload=${ef.take(200).replace('\n', ' ')}")
+                LogBus.log("| # $realm/$model responses 上游 error 帧 kind=$kind payload=${ef.safeTake(200).replace('\n', ' ')}")
                 ev("response.failed", buildJsonObject {
                     put("type", JsonPrimitive("response.failed"))
                     put(
                         "response",
-                        envelope(id, clientModel, createdAt, "failed", buildJsonArray { }, 0, 0, 0, effort, ef.take(400), 0, 0, echo),
+                        envelope(id, clientModel, createdAt, "failed", buildJsonArray { }, 0, 0, 0, effort, ef.safeTake(400), 0, 0, echo),
                     )
                 })
                 res.endStream()
@@ -2208,7 +2245,7 @@ object ChatHandler {
                 // 与 endStream），必须标 sent=true。否则 runPipeline 判成「首帧前失败」
                 // 而换号重试 —— 但 Res.sent 已为 true，重试的 chunk 全被丢弃，客户端
                 // 只看到一个 failed，网关却白打 2 次上游（真实计费）并记 3 次错误。
-                return Hop(ok = false, sent = true)
+                return Hop(ok = false, sent = true, errKind = kind, errBody = ef)
             }
 
             // DSML：吐出暂扣的尾部正文，并把还原出的调用并入 toolCalls，让它们与结构化
@@ -2341,13 +2378,6 @@ object ChatHandler {
                     (if (truncated) " [截断→incomplete]" else "") + " id=$reqId",
             )
             return Hop(ok = true, usage.prompt, ct, tt)
-        }
-
-        private fun mapCode(kind: ErrKind): Int = when (kind) {
-            ErrKind.SOFT_RATE -> 429
-            ErrKind.HARD_CREDIT -> 402
-            ErrKind.CONTENT_BLOCKED, ErrKind.PROMPT_TOO_LONG, ErrKind.IMAGE_INVALID, ErrKind.BAD_PARAMS, ErrKind.CLIENT -> 400
-            else -> 503
         }
 
         /** 顶层可直通的标量/对象字段（Responses 与 chat 同名同义）。 */

@@ -123,6 +123,14 @@ class Store(private val context: Context) {
                 if (e.uid.isNotBlank()) fresh[e.uid] = e
             }.onFailure { LogBus.log("[sys] 读取账号失败 ${f.name}: ${it.message}") }
         }
+        // 目录列举失败（listFiles 返回 null）或全部条目解码失败时，fresh 为空 ——
+        // 此时 retainAll(emptySet()) 等价于「清空整池」，与这里「任何时刻都不出现缓存清空
+        // 中间态」的目标相反（症状：一次 IO 故障让所有请求 503 no_healthy_account）。
+        // 保留内存里的账号并如实记日志，等下一次读取成功再淘汰。
+        if (fresh.isEmpty() && authCache.isNotEmpty()) {
+            LogBus.log("[sys] 账号目录读取为空（IO 故障或文件损坏），保留内存中的 ${authCache.size} 个账号")
+            return authCache.values.toList()
+        }
         // 不能直接 putAll：续期刚写进内存、磁盘尚未落盘（或落盘失败）时，reload 会用
         // 磁盘上的旧 refresh_token 把新凭证冲掉 —— 上游已轮换 RT，下次刷新 4xx → 判死。
         // 规则：磁盘条目只有在「不旧于内存」时才覆盖（updated_at 相同也覆盖，等价内容）。

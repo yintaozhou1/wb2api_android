@@ -42,14 +42,33 @@ object ModelService {
     fun maxOutputTokens(realm: String, model: String): Long =
         cache.firstOrNull { it.realm == realm && it.model == model }?.max_output_tokens ?: 0L
 
+    /**
+     * 刷新串行化用（不能再用 `synchronized(this)`：需要 `tryLock(超时)` 的「有限等待」语义，
+     * 见下方注释）。
+     */
+    private val refreshLock = java.util.concurrent.locks.ReentrantLock()
+
     private fun cached(force: Boolean): List<ModelInfo> {
         // 快路径：无锁读（@Volatile 保证可见性）。
         if (!force && cache.isNotEmpty() && System.currentTimeMillis() - cachedAt < TTL) return cache
-        // 慢路径：**加锁串行化刷新**。否则并发请求会各自打满 4 路上游探测
+        // 慢路径：**加锁串行化刷新**。否则并发请求会各自打满 3 路上游探测
         // （thundering herd），并且互相覆盖结果；加锁后同一时刻只有一次真实探测。
-        return synchronized(this) {
+        //
+        // 但「排队等」必须有上限：探测要打 3 路上游（秒级），而本网关的 HTTP 工作池只有
+        // 32 个线程且满了直接 503（HttpServer 的 SynchronousQueue + AbortPolicy）——
+        // 一批并发 `/v1/models` 就能把所有工作线程堵在这把锁上，把聊天请求一起拖成 503。
+        // 因此除显式 force（用户点「刷新模型」）外，**最多等 1.5s**，超时就用现有缓存
+        // 返回（空缓存 = 未知，Rewrite 据此不干预额度/档位，不会出错）。
+        val locked = try {
+            if (force) { refreshLock.lock(); true }
+            else refreshLock.tryLock(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt(); false
+        }
+        if (!locked) return cache
+        return try {
             if (!force && cache.isNotEmpty() && System.currentTimeMillis() - cachedAt < TTL) {
-                return@synchronized cache
+                return cache
             }
             val result = mutableListOf<ModelInfo>()
             val realmAccounts = Gateway.store.auths().groupBy { it.realm }
@@ -71,7 +90,11 @@ object ModelService {
                 cache = result + kept
                 cachedAt = System.currentTimeMillis()
             }
-            if (result.isNotEmpty()) result else cache
+            // 返回**合并后**的 cache：只含本次成功域的 result 会让 /v1/models 少一个域，
+            // 而那正是上面注释要避免的「模型少了」。
+            cache
+        } finally {
+            refreshLock.unlock()
         }
     }
 

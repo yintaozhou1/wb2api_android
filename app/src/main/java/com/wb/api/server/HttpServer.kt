@@ -95,9 +95,11 @@ class Res(private val out: OutputStream, private val guard: WriteGuard? = null) 
 
     private fun statusText(c: Int) = when (c) {
         200 -> "OK"; 204 -> "No Content"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 404 -> "Not Found"
+        // 402 真会被回给客户端（积分耗尽 HARD_CREDIT），落进 else 会拼出「402 OK」。
+        402 -> "Payment Required"; 405 -> "Method Not Allowed"; 409 -> "Conflict"
         413 -> "Payload Too Large"
         429 -> "Too Many Requests"; 500 -> "Internal Server Error"; 501 -> "Not Implemented"
-        502 -> "Bad Gateway"; 503 -> "Service Unavailable"; else -> "OK"
+        502 -> "Bad Gateway"; 503 -> "Service Unavailable"; 504 -> "Gateway Timeout"; else -> "OK"
     }
 
     private fun writeHeaders(code: Int, ctype: String, len: Long?, chunked: Boolean, extra: Map<String, String> = emptyMap()) {
