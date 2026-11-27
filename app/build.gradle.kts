@@ -15,8 +15,8 @@ android {
         applicationId = "com.wb.api"
         minSdk = 32
         targetSdk = 37
-        versionCode = 53
-        versionName = "1.7.4"
+        versionCode = 54
+        versionName = "1.7.5"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
